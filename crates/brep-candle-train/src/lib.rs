@@ -21,8 +21,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use acad_brep_dataset::{
-    hash_strings_hex, load_manifest, load_metadata, load_samples, BrepSampleLabels, DatasetRecord,
-    DatasetSplit, CLASS_NAMES,
+    harness_record_split, hash_strings_hex, load_manifest, load_metadata, load_samples,
+    BrepSampleLabels, DatasetRecord, DatasetSplit, HarnessConfig, HarnessRecordSplit, CLASS_NAMES,
 };
 use acad_brep_encoder::{
     GraphTensorizer, GraphTensors, EDGE_CATEGORICAL_DIM, EDGE_GRID_CHANNELS, EDGE_SCALAR_DIM,
@@ -97,6 +97,9 @@ pub struct FaceSegmentationConfig {
     /// Sampling strategy for training records when a sample limit is set.
     pub sampling_strategy: FaceSamplingStrategy,
     pub eval_split: DatasetSplit,
+    pub validation_percent: u8,
+    pub validation_seed: u64,
+    pub final_test: bool,
     pub shuffle_each_epoch: bool,
 }
 
@@ -114,7 +117,27 @@ impl Default for FaceSegmentationConfig {
             use_class_weights: false,
             sampling_strategy: FaceSamplingStrategy::Uniform,
             eval_split: DatasetSplit::Val,
+            validation_percent: 10,
+            validation_seed: 42,
+            final_test: false,
             shuffle_each_epoch: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaceEvaluationPolicy {
+    ManifestValidation,
+    HashTrainValidation,
+    FinalTest,
+}
+
+impl FaceEvaluationPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ManifestValidation => "manifest_val",
+            Self::HashTrainValidation => "hash_from_manifest_train",
+            Self::FinalTest => "manifest_test_final",
         }
     }
 }
@@ -149,6 +172,12 @@ pub struct FaceSegmentationReport {
     pub rounds: usize,
     pub batch_size: usize,
     pub eval_split: DatasetSplit,
+    pub eval_policy: FaceEvaluationPolicy,
+    pub train_split_name: String,
+    pub eval_split_name: String,
+    pub validation_percent: u8,
+    pub validation_seed: u64,
+    pub final_test: bool,
     pub face_label_names: Vec<String>,
     pub train_face_label_counts: Vec<usize>,
     pub eval_face_label_counts: Vec<usize>,
@@ -200,6 +229,9 @@ pub struct FaceSegmentationDataset {
     pub train: Vec<FaceSegmentationExample>,
     pub eval: Vec<FaceSegmentationExample>,
     pub label_names: Vec<String>,
+    pub eval_policy: FaceEvaluationPolicy,
+    pub train_split_name: String,
+    pub eval_split_name: String,
 }
 
 pub type LabeledGraphTensor = (GraphTensors, u32);
@@ -305,21 +337,14 @@ pub fn build_face_segmentation_dataset(
         .collect();
 
     let records = load_manifest(root).map_err(to_candle_error)?;
-    let train_records: Vec<_> = records
-        .iter()
-        .filter(|record| record.split == DatasetSplit::Train)
-        .collect();
-    let eval_records: Vec<_> = records
-        .iter()
-        .filter(|record| record.split == config.eval_split)
-        .collect();
+    let split_selection = select_face_train_eval_records(&records, config)?;
 
     let tensorizer = GraphTensorizer::default();
     let train = load_face_examples(
         root,
         select_records_with_strategy(
             root,
-            &train_records,
+            &split_selection.train,
             config.max_train_samples,
             config.sampling_strategy,
             &label_to_id,
@@ -331,7 +356,7 @@ pub fn build_face_segmentation_dataset(
         root,
         select_records_with_strategy(
             root,
-            &eval_records,
+            &split_selection.eval,
             config.max_eval_samples,
             FaceSamplingStrategy::Uniform,
             &label_to_id,
@@ -344,7 +369,92 @@ pub fn build_face_segmentation_dataset(
         train,
         eval,
         label_names: metadata.face_label_set,
+        eval_policy: split_selection.policy,
+        train_split_name: split_selection.train_split_name,
+        eval_split_name: split_selection.eval_split_name,
     })
+}
+
+struct FaceRecordSplitSelection<'a> {
+    train: Vec<&'a DatasetRecord>,
+    eval: Vec<&'a DatasetRecord>,
+    policy: FaceEvaluationPolicy,
+    train_split_name: String,
+    eval_split_name: String,
+}
+
+fn select_face_train_eval_records(
+    records: &[DatasetRecord],
+    config: FaceSegmentationConfig,
+) -> Result<FaceRecordSplitSelection<'_>> {
+    match config.eval_split {
+        DatasetSplit::Val => {
+            let has_manifest_val = records
+                .iter()
+                .any(|record| record.split == DatasetSplit::Val);
+            if has_manifest_val {
+                Ok(FaceRecordSplitSelection {
+                    train: records
+                        .iter()
+                        .filter(|record| record.split == DatasetSplit::Train)
+                        .collect(),
+                    eval: records
+                        .iter()
+                        .filter(|record| record.split == DatasetSplit::Val)
+                        .collect(),
+                    policy: FaceEvaluationPolicy::ManifestValidation,
+                    train_split_name: DatasetSplit::Train.as_str().to_string(),
+                    eval_split_name: DatasetSplit::Val.as_str().to_string(),
+                })
+            } else {
+                let harness_config = HarnessConfig {
+                    validation_percent: config.validation_percent,
+                    validation_seed: config.validation_seed,
+                    ..Default::default()
+                };
+                let mut train = Vec::new();
+                let mut eval = Vec::new();
+                for record in records {
+                    match harness_record_split(record, false, &harness_config) {
+                        HarnessRecordSplit::TrainInner => train.push(record),
+                        HarnessRecordSplit::ValInner => eval.push(record),
+                        HarnessRecordSplit::TestFinal => {}
+                    }
+                }
+                Ok(FaceRecordSplitSelection {
+                    train,
+                    eval,
+                    policy: FaceEvaluationPolicy::HashTrainValidation,
+                    train_split_name: HarnessRecordSplit::TrainInner.as_str().to_string(),
+                    eval_split_name: HarnessRecordSplit::ValInner.as_str().to_string(),
+                })
+            }
+        }
+        DatasetSplit::Test => {
+            if !config.final_test {
+                return Err(candle_core::Error::Msg(
+                    "face segmentation test evaluation requires final_test=true; CLI users must pass --final-test"
+                        .to_string(),
+                ));
+            }
+            Ok(FaceRecordSplitSelection {
+                train: records
+                    .iter()
+                    .filter(|record| record.split == DatasetSplit::Train)
+                    .collect(),
+                eval: records
+                    .iter()
+                    .filter(|record| record.split == DatasetSplit::Test)
+                    .collect(),
+                policy: FaceEvaluationPolicy::FinalTest,
+                train_split_name: DatasetSplit::Train.as_str().to_string(),
+                eval_split_name: DatasetSplit::Test.as_str().to_string(),
+            })
+        }
+        DatasetSplit::Train => Err(candle_core::Error::Msg(
+            "face segmentation eval split cannot be train".to_string(),
+        )),
+    }
 }
 
 fn select_records_with_strategy<'a>(
@@ -1181,6 +1291,12 @@ fn train_face_segmentation_with_optional_save(
         rounds: config.rounds,
         batch_size,
         eval_split: config.eval_split,
+        eval_policy: dataset.eval_policy,
+        train_split_name: dataset.train_split_name,
+        eval_split_name: dataset.eval_split_name,
+        validation_percent: config.validation_percent,
+        validation_seed: config.validation_seed,
+        final_test: config.final_test,
         face_label_names: dataset.label_names,
         train_face_label_counts,
         eval_face_label_counts,
@@ -1737,6 +1853,73 @@ mod tests {
         assert!(report.final_loss.is_finite());
         assert!(report.train_faces > 0);
         assert!(report.face_classes > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn face_segmentation_uses_hash_validation_when_manifest_has_no_val() {
+        let root = std::env::temp_dir().join(format!(
+            "acad-brep-face-inner-val-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        acad_brep_dataset::generate_synthetic_dataset(
+            &root,
+            acad_brep_dataset::DatasetConfig {
+                samples_per_class: 4,
+                val_fraction: 0.0,
+            },
+        )
+        .expect("dataset writes");
+
+        let dataset = build_face_segmentation_dataset(
+            &root,
+            FaceSegmentationConfig {
+                max_train_samples: None,
+                max_eval_samples: None,
+                validation_percent: 50,
+                ..Default::default()
+            },
+        )
+        .expect("face dataset loads with hash validation");
+
+        assert_eq!(
+            dataset.eval_policy,
+            FaceEvaluationPolicy::HashTrainValidation
+        );
+        assert_eq!(dataset.train_split_name, "train_inner");
+        assert_eq!(dataset.eval_split_name, "val_inner");
+        assert!(!dataset.train.is_empty());
+        assert!(!dataset.eval.is_empty());
+        assert_eq!(dataset.train.len() + dataset.eval.len(), 12);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn face_segmentation_requires_final_test_opt_in() {
+        let root =
+            std::env::temp_dir().join(format!("acad-brep-face-final-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        acad_brep_dataset::generate_synthetic_dataset(
+            &root,
+            acad_brep_dataset::DatasetConfig {
+                samples_per_class: 2,
+                val_fraction: 0.25,
+            },
+        )
+        .expect("dataset writes");
+
+        let result = build_face_segmentation_dataset(
+            &root,
+            FaceSegmentationConfig {
+                eval_split: DatasetSplit::Test,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }

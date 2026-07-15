@@ -12,8 +12,9 @@ use acad_brep_candle_train::{
     TrainingReport,
 };
 use acad_brep_dataset::{
-    generate_synthetic_dataset, manifest_hash, summarize_dataset, write_dataset_harness,
-    DatasetConfig, DatasetHarnessReport, DatasetSplit, DatasetSummary, HarnessConfig,
+    generate_synthetic_dataset, inspect_dataset_harness, manifest_hash, summarize_dataset,
+    write_dataset_harness, DatasetConfig, DatasetHarnessReport, DatasetSplit, DatasetSummary,
+    HarnessConfig, FINGERPRINT_HASH_ALGORITHM,
 };
 use serde::Serialize;
 
@@ -114,8 +115,10 @@ struct FaceTrainJsonReport {
     git_dirty: Option<bool>,
     dataset_path: String,
     manifest_hash: Option<String>,
+    manifest_hash_algorithm: &'static str,
     config: FaceTrainConfigReport,
     sampler: FaceTrainSamplerReport,
+    rare_label_metrics: FaceTrainRareLabelMetricsReport,
     final_loss: f32,
     train_metrics: acad_brep_candle_train::FaceEvaluationMetrics,
     eval_metrics: acad_brep_candle_train::FaceEvaluationMetrics,
@@ -134,6 +137,12 @@ struct FaceTrainConfigReport {
     use_class_weights: bool,
     sampling_strategy: String,
     eval_split: String,
+    eval_policy: String,
+    train_split_name: String,
+    eval_split_name: String,
+    validation_percent: u8,
+    validation_seed: u64,
+    final_test: bool,
     shuffle_each_epoch: bool,
 }
 
@@ -145,6 +154,17 @@ struct FaceTrainSamplerReport {
     eval_samples: usize,
     train_faces: usize,
     eval_faces: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FaceTrainRareLabelMetricsReport {
+    labels: Vec<String>,
+    train_support: usize,
+    train_macro_f1: Option<f32>,
+    train_macro_iou: Option<f32>,
+    eval_support: usize,
+    eval_macro_f1: Option<f32>,
+    eval_macro_iou: Option<f32>,
 }
 
 fn parse_dataset_args(args: impl Iterator<Item = String>) -> DatasetArgs {
@@ -346,6 +366,13 @@ fn parse_face_train_args(args: impl Iterator<Item = String>) -> FaceTrainArgs {
             "--eval-split" => {
                 config.eval_split = parse_eval_split(next_string(&mut args, "--eval-split"))
             }
+            "--validation-percent" => {
+                config.validation_percent = parse_next(&mut args, "--validation-percent")
+            }
+            "--validation-seed" => {
+                config.validation_seed = parse_next(&mut args, "--validation-seed")
+            }
+            "--final-test" => config.final_test = true,
             "--no-shuffle" => config.shuffle_each_epoch = false,
             "--save" => save = Some(PathBuf::from(next_string(&mut args, "--save"))),
             "--report" => report = Some(PathBuf::from(next_string(&mut args, "--report"))),
@@ -355,6 +382,19 @@ fn parse_face_train_args(args: impl Iterator<Item = String>) -> FaceTrainArgs {
             }
             unknown => die_unknown(unknown),
         }
+    }
+
+    if config.eval_split == DatasetSplit::Test && !config.final_test {
+        eprintln!("--eval-split test requires --final-test");
+        std::process::exit(2);
+    }
+    if config.final_test && config.eval_split != DatasetSplit::Test {
+        eprintln!("--final-test requires --eval-split test");
+        std::process::exit(2);
+    }
+    if config.validation_percent > 100 {
+        eprintln!("invalid value for --validation-percent: expected 0..=100");
+        std::process::exit(2);
     }
 
     FaceTrainArgs {
@@ -658,12 +698,16 @@ fn write_face_train_report(
     {
         fs::create_dir_all(parent).map_err(to_candle_error)?;
     }
+    let rare_label_metrics = face_train_rare_label_metrics(data, config, report);
     let json_report = FaceTrainJsonReport {
         report_version: "acad-brep-face-train-report-v1",
-        git_commit: git_output(["rev-parse", "HEAD"]),
-        git_dirty: git_output(["status", "--porcelain"]).map(|output| !output.trim().is_empty()),
+        git_commit: build_git_commit().or_else(|| git_output(["rev-parse", "HEAD"])),
+        git_dirty: build_git_dirty().or_else(|| {
+            git_output(["status", "--porcelain"]).map(|output| !output.trim().is_empty())
+        }),
         dataset_path: data.display().to_string(),
         manifest_hash: manifest_hash(data).ok(),
+        manifest_hash_algorithm: FINGERPRINT_HASH_ALGORITHM,
         config: FaceTrainConfigReport {
             epochs: config.epochs,
             learning_rate: config.learning_rate,
@@ -676,6 +720,12 @@ fn write_face_train_report(
             use_class_weights: config.use_class_weights,
             sampling_strategy: config.sampling_strategy.as_str().to_string(),
             eval_split: config.eval_split.as_str().to_string(),
+            eval_policy: report.eval_policy.as_str().to_string(),
+            train_split_name: report.train_split_name.clone(),
+            eval_split_name: report.eval_split_name.clone(),
+            validation_percent: config.validation_percent,
+            validation_seed: config.validation_seed,
+            final_test: config.final_test,
             shuffle_each_epoch: config.shuffle_each_epoch,
         },
         sampler: FaceTrainSamplerReport {
@@ -686,12 +736,92 @@ fn write_face_train_report(
             train_faces: report.train_faces,
             eval_faces: report.eval_faces,
         },
+        rare_label_metrics,
         final_loss: report.final_loss,
         train_metrics: report.train_metrics.clone(),
         eval_metrics: report.eval_metrics.clone(),
     };
     let json = serde_json::to_string_pretty(&json_report).map_err(to_candle_error)?;
     fs::write(path, json).map_err(to_candle_error)
+}
+
+fn face_train_rare_label_metrics(
+    data: &Path,
+    config: FaceSegmentationConfig,
+    report: &FaceSegmentationReport,
+) -> FaceTrainRareLabelMetricsReport {
+    let harness = inspect_dataset_harness(
+        data,
+        HarnessConfig {
+            validation_percent: config.validation_percent,
+            validation_seed: config.validation_seed,
+            ..Default::default()
+        },
+    )
+    .ok();
+    let labels = harness
+        .map(|report| report.rare_face_labels)
+        .unwrap_or_default();
+    let train = aggregate_rare_metrics(&report.train_metrics, &labels);
+    let eval = aggregate_rare_metrics(&report.eval_metrics, &labels);
+    FaceTrainRareLabelMetricsReport {
+        labels,
+        train_support: train.support,
+        train_macro_f1: train.macro_f1,
+        train_macro_iou: train.macro_iou,
+        eval_support: eval.support,
+        eval_macro_f1: eval.macro_f1,
+        eval_macro_iou: eval.macro_iou,
+    }
+}
+
+struct RareAggregate {
+    support: usize,
+    macro_f1: Option<f32>,
+    macro_iou: Option<f32>,
+}
+
+fn aggregate_rare_metrics(
+    metrics: &acad_brep_candle_train::FaceEvaluationMetrics,
+    labels: &[String],
+) -> RareAggregate {
+    let mut support = 0usize;
+    let mut f1_sum = 0.0f32;
+    let mut iou_sum = 0.0f32;
+    let mut count = 0usize;
+
+    for label in labels {
+        if let Some(class_metric) = metrics
+            .class_metrics
+            .iter()
+            .find(|metric| metric.label == *label)
+        {
+            support += class_metric.support;
+            f1_sum += class_metric.f1;
+            iou_sum += class_metric.iou;
+            count += 1;
+        }
+    }
+
+    RareAggregate {
+        support,
+        macro_f1: (count > 0).then_some(f1_sum / count as f32),
+        macro_iou: (count > 0).then_some(iou_sum / count as f32),
+    }
+}
+
+fn build_git_commit() -> Option<String> {
+    option_env!("ACAD_GIT_COMMIT")
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn build_git_dirty() -> Option<bool> {
+    option_env!("ACAD_GIT_DIRTY").and_then(|value| match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    })
 }
 
 fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
@@ -732,6 +862,10 @@ fn print_face_report(report: &FaceSegmentationReport) {
     println!("epochs: {}", report.epochs);
     println!("train_samples: {}", report.train_samples);
     println!("eval_split: {}", report.eval_split.as_str());
+    println!("eval_policy: {}", report.eval_policy.as_str());
+    println!("train_split_name: {}", report.train_split_name);
+    println!("eval_split_name: {}", report.eval_split_name);
+    println!("final_test: {}", report.final_test);
     println!("eval_samples: {}", report.eval_samples);
     println!("train_faces: {}", report.train_faces);
     println!("eval_faces: {}", report.eval_faces);
@@ -776,6 +910,10 @@ fn print_harness_report(report: &DatasetHarnessReport) {
     println!("harness_version: {}", report.harness_version);
     println!("dataset_version: {}", report.dataset_version);
     println!("manifest_hash: {}", report.manifest_hash);
+    println!(
+        "manifest_hash_algorithm: {}",
+        report.manifest_hash_algorithm
+    );
     println!(
         "split_policy: validation_source={}, validation_percent={}, test_policy={}",
         report.split_policy.validation_source,
@@ -881,6 +1019,7 @@ fn print_help() {
          [--rounds N] [--seed N] [--batch-size N] [--max-train-samples N] \
          [--max-eval-samples N] [--sample-strategy uniform|face-balanced] \
          [--class-weights] [--no-class-weights] [--eval-split val|test] \
+         [--validation-percent N] [--validation-seed N] [--final-test] \
          [--no-shuffle] [--save PATH] [--report PATH]\n\n  \
          Without a subcommand, training uses the in-memory synthetic dataset for backward compatibility."
     );

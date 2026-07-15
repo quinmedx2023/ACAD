@@ -8,7 +8,7 @@ deployment inference. Proper training methodology (val split, seeding,
 normalization, F1, checkpoint load).
 
 ## Current Phase
-Phase L V2 complete; V3 pending
+Phase N review fixes complete; Phase L V3 pending
 
 ## Phases
 
@@ -107,6 +107,24 @@ Phase L V2 complete; V3 pending
 - [x] Keep run directories, generated markdown, and multi-seed automation as later work.
 - [x] Update docs and use the harness plan as the next implementation checklist.
 - **Status:** in_progress
+
+### Phase M: Fusion face segmentation benchmark
+- [x] Confirm regenerated `data\fusion-seg-v1` harness and manifest hash.
+- [x] Add a reusable Python benchmark script so runs are repeatable.
+- [x] Run comparable `face-train --report` experiments with fixed seed, graph budget, and official test eval split.
+- [x] Compare uniform, class-weighted, face-balanced, and larger-model variants.
+- [x] Write a concise benchmark report with metrics, runtime, and caveats.
+- **Status:** complete
+
+### Phase N: Dataset harness review fixes
+- [x] Make `face-train` default to the harness inner validation split when the manifest has no `val`.
+- [x] Require explicit `--final-test` for official `test` evaluation.
+- [x] Record `eval_policy`, split names, validation seed/percent, and `final_test` in run reports.
+- [x] Add rare-label aggregate support, macro-F1, and macro-IoU to run reports.
+- [x] Upgrade dataset and selected-ID hashes to SHA-256 and record the hash algorithm.
+- [x] Embed build-time git commit/dirty metadata for report provenance.
+- [x] Update docs, scripts, and benchmark notes to avoid routine test-set use.
+- **Status:** complete
 
 ## Decisions Made
 | Decision | Rationale |

@@ -78,7 +78,6 @@ cargo run -p acad-brep-candle-train -- face-train `
   --batch-size 8 `
   --max-train-samples 512 `
   --max-eval-samples 128 `
-  --eval-split test `
   --save target\fusion-face-seg-default-smoke.safetensors
 ```
 
@@ -210,8 +209,7 @@ cargo run -p acad-brep-candle-train -- face-train `
   --hidden 32 `
   --batch-size 8 `
   --max-train-samples 512 `
-  --max-eval-samples 128 `
-  --eval-split test
+  --max-eval-samples 128
 ```
 
 Use `--class-weights` or `--sample-strategy face-balanced` only for diagnostics

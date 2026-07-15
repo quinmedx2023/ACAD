@@ -270,7 +270,7 @@ Candle-native per user request ("candle not OK?" → yes, Candle is capable).
   - `clean-fusion --limit 5` wrote 4 train / 1 test records to `data\fusion-seg-review-smoke`.
   - Verified those 5 manifest splits exactly match `train_test.json`.
   - Default face training on that smoke failed clearly because no `val` rows exist.
-  - `face-train --eval-split test --max-eval-samples 0` passed and wrote `target\fusion-review-smoke.metadata.json` with `eval_split: test`.
+  - Historical pre-guard run: `face-train --eval-split test --max-eval-samples 0` passed and wrote `target\fusion-review-smoke.metadata.json` with `eval_split: test`. Current CLI requires `--final-test` with `--eval-split test`.
 
 ### Phase G: Fusion face segmentation training
 - **Status:** complete
@@ -455,6 +455,75 @@ Candle-native per user request ("candle not OK?" → yes, Candle is capable).
 | 2026-07-15 | `onig_sys` could not find `vcruntime.h` | 1 | Set explicit VS2022 `PATH` and `INCLUDE` paths for cargo verification. |
 | 2026-07-15 | `git -c safe.directory=... status --short` warned about unreadable user git ignore | 1 | Noted only; command still listed generated files. |
 
+### Phase M: Fusion face segmentation benchmark
+- **Status:** complete
+- Goal:
+  - Train several comparable Candle face-segmentation models on the regenerated
+    Fusion dataset and report benchmark metrics from `face-train --report`.
+- Benchmark boundary:
+  - Use the existing trainer and report schema.
+  - Fixed dataset: `data\fusion-seg-v1`.
+  - Fixed seed and graph budgets per comparison.
+  - Historical benchmark used the official test split because the trainer did
+    not yet support harness inner validation.
+  - Treat those results as engineering benchmarks, not final model-selection
+    numbers.
+- Added reusable script plan:
+  - `scripts\train_fusion_face_benchmark.py` is the canonical reusable runner.
+  - default variants: uniform, weighted, face-balanced, large
+  - outputs per-run JSON/log/checkpoint plus `summary.csv` and `summary.md`
+- Error while verifying script:
+  - First smoke run used `Args` as a PowerShell function parameter name, which
+    collided with the automatic `$args` variable and launched the trainer
+    without subcommand arguments.
+  - Fixed by renaming the parameter to `ArgumentList`.
+- User requested removing the PowerShell version after adding Python; deleted
+  the earlier PowerShell benchmark script.
+- Verification:
+  - Script smoke passed with `--variants uniform --train-samples 8
+    --eval-samples 4 --epochs 1 --no-save-models --force`.
+  - The smoke wrote `summary.csv` and `summary.md`.
+- Benchmark run:
+  - Output directory: `target\benchmarks\fusion-face-20260715`.
+  - Dataset manifest hash migrated to SHA-256:
+    `d290dac73d051d268a56516231b641d4f8875f5eea71c69c4b0235a36068030c`.
+  - Fixed budget: 1,024 train graphs, 256 eval graphs, 3 epochs, seed 42.
+  - Best eval accuracy / weighted-F1: `uniform_h64_r2` at 55.53% accuracy and
+    0.4839 weighted-F1.
+  - Best macro-F1 / macro-IoU: `face_balanced_h32_r1` at 0.3028 macro-F1 and
+    0.1926 mIoU, but it used 118,689 train faces versus 22,468 for uniform at
+    the same graph budget.
+  - `segment_7` still has only 1 eval face in the 256-graph eval sample, so rare
+    class performance is not measured reliably.
+- Documentation:
+  - Added `docs/fusion_face_benchmark_20260715.md`.
+
+### Phase N: Dataset harness review fixes
+- **Status:** complete
+- Review addressed:
+  - `face-train` now uses the same hash-based `train_inner`/`val_inner`
+    validation policy as `inspect-harness` when the manifest has no `val`
+    split.
+  - Official test evaluation now requires explicit `--final-test`; reports mark
+    `final_test`, `eval_policy`, `train_split_name`, and `eval_split_name`.
+  - Run reports include rare-label aggregate support, macro-F1, and macro-IoU
+    based on the harness rare-label set.
+  - Manifest and selected-ID hashes now use SHA-256; reports include
+    `manifest_hash_algorithm: sha256`.
+  - `brep-candle-train` embeds build-time git commit/dirty metadata so reports
+    are not dependent on the runtime working directory.
+- Verification:
+  - `cargo test --workspace` passed under VS2022 `vcvars64.bat`.
+  - `cargo build -p acad-brep-candle-train` passed under VS2022 `vcvars64.bat`.
+  - `inspect-harness` on `data\fusion-seg-v1` produced the SHA-256 manifest
+    hash above.
+  - Default `face-train` smoke used `eval_policy: hash_from_manifest_train`,
+    `train_split_name: train_inner`, and `eval_split_name: val_inner`.
+  - `face-train --eval-split test` without `--final-test` failed as intended.
+  - `face-train --eval-split test --final-test` passed and reported
+    `eval_policy: manifest_test_final`.
+  - Python benchmark script smoke passed on default inner validation.
+
 ### Phase L: Face-data distribution, rare-class metrics, and sampling
 - **Status:** in_progress
 - Goal:
@@ -501,7 +570,7 @@ Candle-native per user request ("candle not OK?" → yes, Candle is capable).
   - `cargo test --workspace` passed: 23 unit tests plus doc tests.
   - `cmake --build tools\occt_cleaner\build-openenv-release --config Release` passed.
   - `clean-fusion --raw data\s2.0.1_extended_step --out data\fusion-seg-review-smoke --limit 5 --allow-boundary` passed using the default sidecar path: 5 records, 4 train, 1 test.
-  - `face-train --data data\fusion-seg-review-smoke --epochs 1 --rounds 1 --hidden 16 --batch-size 2 --max-train-samples 0 --max-eval-samples 0 --eval-split test --save target\fusion-review-smoke.safetensors` passed and wrote a minimal metadata sidecar.
+  - Historical pre-guard run: `face-train --data data\fusion-seg-review-smoke --epochs 1 --rounds 1 --hidden 16 --batch-size 2 --max-train-samples 0 --max-eval-samples 0 --eval-split test --save target\fusion-review-smoke.safetensors` passed and wrote a minimal metadata sidecar. Current CLI requires `--final-test` with `--eval-split test`.
 
 ## 5-Question Reboot Check
 | Question | Answer |

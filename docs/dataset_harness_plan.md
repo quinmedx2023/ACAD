@@ -112,7 +112,7 @@ formats.
 
 - harness version
 - dataset format version
-- manifest hash
+- manifest SHA-256 hash
 - split-file hash when official `train_test.json` is used
 - cleaner config that changes data semantics, especially `allow_boundary` and
   split source
@@ -125,8 +125,9 @@ formats.
 - labels missing from train_inner or val_inner
 - train/val distribution drift
 
-Use the manifest hash as the cleaned-dataset fingerprint. It is cheap, stable,
-and sufficient for tying a training run to one cleaned dataset state.
+Use the manifest SHA-256 hash as the cleaned-dataset fingerprint. Short hashes
+are acceptable for split assignment and selected-ID hashes, but dataset
+provenance should use a collision-resistant fingerprint.
 
 ## Rare Labels
 
@@ -170,7 +171,7 @@ V2 does not need a directory tree. The report should contain:
 - git commit SHA and dirty flag
 - full resolved training config
 - dataset path and manifest hash
-- harness version and rare-label set
+- harness version, rare-label set, and rare-label macro-F1/IoU
 - sampler name, sampler config, seed
 - selected train IDs hash
 - selected eval IDs hash

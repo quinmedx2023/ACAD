@@ -22,12 +22,14 @@ use acad_brep_graph::{
     SurfaceKind,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const DATASET_VERSION: &str = "acad-brep-dataset-v1";
 pub const MANIFEST_FILE: &str = "manifest.jsonl";
 pub const DATASET_FILE: &str = "dataset.json";
 pub const HARNESS_FILE: &str = "harness.json";
 pub const HARNESS_VERSION: &str = "acad-brep-dataset-harness-v1";
+pub const FINGERPRINT_HASH_ALGORITHM: &str = "sha256";
 pub const GRAPHS_DIR: &str = "graphs";
 pub const LABELS_DIR: &str = "labels";
 
@@ -144,6 +146,7 @@ pub struct DatasetHarnessReport {
     pub harness_version: String,
     pub dataset_version: String,
     pub manifest_hash: String,
+    pub manifest_hash_algorithm: String,
     pub split_file_hash: Option<String>,
     pub split_policy: HarnessSplitPolicy,
     pub record_counts_by_split: BTreeMap<String, usize>,
@@ -187,6 +190,24 @@ pub struct RareLabelPolicy {
 pub struct LabelDriftReport {
     pub total_variation: Option<f32>,
     pub labels: BTreeMap<String, LabelDrift>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessRecordSplit {
+    TrainInner,
+    ValInner,
+    TestFinal,
+}
+
+impl HarnessRecordSplit {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrainInner => "train_inner",
+            Self::ValInner => "val_inner",
+            Self::TestFinal => "test_final",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -435,6 +456,7 @@ pub fn inspect_dataset_harness(
         harness_version: HARNESS_VERSION.to_string(),
         dataset_version: metadata.version,
         manifest_hash,
+        manifest_hash_algorithm: FINGERPRINT_HASH_ALGORITHM.to_string(),
         split_file_hash,
         split_policy: HarnessSplitPolicy {
             validation_source: validation_source.to_string(),
@@ -484,26 +506,26 @@ pub fn manifest_hash(root: impl AsRef<Path>) -> Result<String, DatasetError> {
 }
 
 pub fn hash_strings_hex(values: &[String]) -> String {
-    let mut hash = FNV_OFFSET;
+    let mut hash = Sha256::new();
     for value in values {
-        hash = fnv1a_update(hash, value.as_bytes());
-        hash = fnv1a_update(hash, &[0]);
+        hash.update(value.as_bytes());
+        hash.update([0]);
     }
-    format!("{hash:016x}")
+    format!("{:x}", hash.finalize())
 }
 
 pub fn hash_file_hex(path: impl AsRef<Path>) -> Result<String, DatasetError> {
     let mut file = fs::File::open(path)?;
-    let mut hash = FNV_OFFSET;
+    let mut hash = Sha256::new();
     let mut buffer = [0u8; 8192];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        hash = fnv1a_update(hash, &buffer[..read]);
+        hash.update(&buffer[..read]);
     }
-    Ok(format!("{hash:016x}"))
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn summarize_records(
@@ -546,26 +568,41 @@ fn summarize_records(
     })
 }
 
-fn harness_split_name(
+pub fn manifest_has_validation(records: &[DatasetRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| record.split == DatasetSplit::Val)
+}
+
+pub fn harness_record_split(
     record: &DatasetRecord,
     has_manifest_val: bool,
     config: &HarnessConfig,
-) -> String {
+) -> HarnessRecordSplit {
     match record.split {
         DatasetSplit::Train if !has_manifest_val => {
             if config.validation_percent > 0
                 && id_percent(&record.id, config.validation_seed) < config.validation_percent
             {
-                "val_inner"
+                HarnessRecordSplit::ValInner
             } else {
-                "train_inner"
+                HarnessRecordSplit::TrainInner
             }
         }
-        DatasetSplit::Train => "train_inner",
-        DatasetSplit::Val => "val_inner",
-        DatasetSplit::Test => "test_final",
+        DatasetSplit::Train => HarnessRecordSplit::TrainInner,
+        DatasetSplit::Val => HarnessRecordSplit::ValInner,
+        DatasetSplit::Test => HarnessRecordSplit::TestFinal,
     }
-    .to_string()
+}
+
+fn harness_split_name(
+    record: &DatasetRecord,
+    has_manifest_val: bool,
+    config: &HarnessConfig,
+) -> String {
+    harness_record_split(record, has_manifest_val, config)
+        .as_str()
+        .to_string()
 }
 
 fn record_label_counts(
@@ -928,7 +965,8 @@ mod tests {
 
         assert_eq!(report.harness_version, HARNESS_VERSION);
         assert_eq!(report.dataset_version, DATASET_VERSION);
-        assert_eq!(report.manifest_hash.len(), 16);
+        assert_eq!(report.manifest_hash.len(), 64);
+        assert_eq!(report.manifest_hash_algorithm, FINGERPRINT_HASH_ALGORITHM);
         assert_eq!(report.split_policy.validation_source, "manifest_val");
         assert!(report.record_counts_by_split.contains_key("train_inner"));
         assert!(report.record_counts_by_split.contains_key("val_inner"));

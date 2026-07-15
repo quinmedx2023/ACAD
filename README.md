@@ -37,6 +37,8 @@ compile) on their own. The graph model is `serde`-serializable for interop.
   Segmentation.
 - `docs/fusion_face_segmentation_example_report.md`: real Fusion face
   segmentation smoke report and comparison results.
+- `docs/fusion_face_benchmark_20260715.md`: current reusable-script benchmark
+  results on regenerated Fusion data.
 - `docs/minimal_dataset_training_pipeline.md`: the hybrid dataset/training notes.
 
 ## Commands
@@ -61,8 +63,11 @@ cargo run -p acad-brep-candle-train -- `
 cargo run -p acad-brep-candle-train -- `
   face-train --data data/fusion-seg-v1 --epochs 3 --rounds 1 --hidden 32 `
   --batch-size 8 --max-train-samples 512 --max-eval-samples 128 `
-  --eval-split test `
   --save target/fusion-face-seg-smoke.safetensors
+
+# Reusable Fusion face-segmentation benchmark script.
+python scripts/train_fusion_face_benchmark.py `
+  --train-samples 1024 --eval-samples 256 --epochs 3
 ```
 
 Latest local dataset run (27 train / 9 held-out val samples): `final_loss
@@ -73,6 +78,6 @@ read on what this does and does not demonstrate.
 Historical Fusion face-segmentation smoke on the legacy modulo-split cleaned
 dataset (512 sampled train graphs / 128 sampled eval graphs): `final_loss
 1.496397`, `train_face_accuracy 45.21%`, `eval_face_accuracy 50.87%`,
-`eval_face_macro_f1 0.1832`. Regenerate Fusion data with the current cleaner for
-official `train`/`test` split preservation and use `--eval-split test`
-deliberately for test evaluation.
+`eval_face_macro_f1 0.1832`. Current Fusion training defaults to a deterministic
+inner validation split carved from official train. Official test evaluation now
+requires `--eval-split test --final-test`.

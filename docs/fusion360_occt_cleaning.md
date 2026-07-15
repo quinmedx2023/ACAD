@@ -144,7 +144,6 @@ cargo run -p acad-brep-candle-train -- face-train `
   --batch-size 8 `
   --max-train-samples 512 `
   --max-eval-samples 128 `
-  --eval-split test `
   --save target/fusion-face-seg-smoke.safetensors
 ```
 
@@ -159,12 +158,14 @@ needed to interpret the checkpoint.
 
 `face-train` uses `labels/*.json` face labels as the supervised target. The
 default config uses uniform manifest sampling plus deterministic per-epoch
-shuffle, instead of loading all 42,912 cleaned graphs. Pass
-`--max-train-samples 0 --max-eval-samples 0` for a full in-memory run.
+shuffle, instead of loading all 42,912 cleaned graphs. On official Fusion data,
+the default eval policy carves `val_inner` from manifest `train` using the
+harness hash policy. Pass `--max-train-samples 0 --max-eval-samples 0` for a
+full in-memory run.
 
-For regenerated official Fusion datasets, use `--eval-split test` intentionally.
-The default `--eval-split val` is retained for synthetic or custom datasets with
-a validation split and fails clearly when no validation rows exist.
+For final official-test evaluation, pass both `--eval-split test` and
+`--final-test`; iterative sampler and hyperparameter checks should stay on the
+default inner validation split.
 
 Optional imbalance controls:
 

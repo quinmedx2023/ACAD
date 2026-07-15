@@ -7,3 +7,4 @@
 /tools/occt_cleaner/build*/
 **/__pycache__
 **/build*
+!**/build.rs

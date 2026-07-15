@@ -114,8 +114,7 @@ cargo run -p acad-brep-candle-train -- face-train `
   --hidden 32 `
   --batch-size 8 `
   --max-train-samples 512 `
-  --max-eval-samples 128 `
-  --eval-split test
+  --max-eval-samples 128
 ```
 
 Output fields include graph sample counts, face counts, `face_classes`,
@@ -136,15 +135,17 @@ Useful face-training flags:
 --sample-strategy uniform|face-balanced
 --class-weights
 --eval-split val|test
+--final-test
 --no-shuffle
 ```
 
 Current short Fusion smoke tests favor uniform train sampling without class
 weights. The face-balanced selector covers rare labels better, but changes the
 sampled training distribution and performed worse in the 512/128 graph smoke.
-Evaluation sampling stays uniform.
-Official Fusion cleanup preserves the dataset's `test` split, so use
-`--eval-split test` deliberately for official train/test runs.
+Evaluation sampling stays uniform. Official Fusion cleanup preserves the
+dataset's `test` split, but routine runs default to the harness inner validation
+split carved from official train. Use `--eval-split test --final-test` only for
+final official-test runs.
 
 Local run (54 train / 18 held-out val):
 
