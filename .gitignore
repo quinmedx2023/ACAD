@@ -1,2 +1,9 @@
 /target/
 **/*.rs.bk
+/raw/
+/data/synthetic-v1
+/data/s2.0.1_extended_step/
+/data/fusion-*/
+/tools/occt_cleaner/build*/
+**/__pycache__
+**/build*

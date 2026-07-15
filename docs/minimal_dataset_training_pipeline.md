@@ -7,10 +7,14 @@ the earlier pooled-MLP smoke test with a real geometry-aware, topology-aware
 model implemented natively in Candle. It still runs on small synthetic data so
 the whole path (data → tensors → conv front-ends → message passing → metrics →
 checkpoint) stays debuggable, but every stage is now the real architecture.
+The same path can train from the on-disk dataset in `data/synthetic-v1`.
+Fusion face segmentation uses the same encoder plus a per-face head trained
+from `labels/*.json`.
 
 ## Dataset
 
-Generated in `acad_brep_candle_train::synthetic_graphs` and tensorized by
+Generated either in memory through `acad_brep_candle_train::synthetic_graphs` or
+on disk through `acad_brep_dataset`, then tensorized by
 `acad_brep_encoder::GraphTensorizer`.
 
 | Label | Class |
@@ -75,6 +79,10 @@ batched by concatenating nodes and offsetting the coedge index arrays. Per-face
 and per-edge embeddings are returned alongside the graph logits for downstream
 face/edge selection and repair-hint heads.
 
+For face segmentation, `FaceSegmentationModel` applies a linear classifier to
+the per-face embeddings. The loss is computed over all faces in the ragged
+batch, with optional inverse-frequency class weighting for imbalanced labels.
+
 ## Training Command
 
 ```powershell
@@ -88,6 +96,36 @@ Flags: `--epochs --lr --hidden --samples-per-class --rounds --seed
 
 Output fields: `epochs, train_samples, val_samples, hidden_dim, rounds,
 final_loss, train_accuracy, val_accuracy, val_macro_f1`.
+
+Fusion face-label training:
+
+```powershell
+cargo run -p acad-brep-candle-train -- face-train `
+  --data data/fusion-seg-v1 `
+  --epochs 3 `
+  --rounds 1 `
+  --hidden 32 `
+  --batch-size 8 `
+  --max-train-samples 512 `
+  --max-val-samples 128
+```
+
+Output fields include graph sample counts, face counts, `face_classes`,
+`train_face_accuracy`, `val_face_accuracy`, `val_face_macro_f1`, sampling
+strategy, and sampled face-label counts.
+
+Useful face-training flags:
+
+```text
+--sample-strategy uniform|face-balanced
+--val-sample-strategy uniform|face-balanced
+--class-weights
+--no-shuffle
+```
+
+Current short Fusion smoke tests favor uniform sampling without class weights.
+The face-balanced selector covers rare labels better, but changes the sampled
+training distribution and performed worse in the 512/128 graph smoke.
 
 Local run (54 train / 18 held-out val):
 
@@ -119,6 +157,6 @@ real kernel topology; see the plan's data and evaluation stages.
 ## Next upgrades
 
 1. Add ordered coedge loops (`next`/`previous`) for full BRepNet walks.
-2. Add face-level / edge-level supervised heads (the embeddings already exist).
-3. Import real STEP/OCCT graphs to replace synthetic geometry.
-4. Add minibatching + a proper train/val/test protocol as datasets grow.
+2. Add edge-level supervised heads.
+3. Add trimming-aware UV masks from OCCT face classification.
+4. Add full-dataset streaming/shuffling for longer Fusion training runs.

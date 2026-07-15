@@ -21,11 +21,13 @@
 | Put the detailed roadmap in `docs/brep_graph_encoder_plan.md` | Keeps project planning separate from task progress logs. |
 | Create `acad-brep-candle-train` | Provides a real Candle training loop over synthetic graph features. |
 | Use pooled graph features for the first Candle model | Good smoke test for the data/training path; real message passing comes next. |
+| Default Fusion face smoke to uniform sampling without class weights | On the current 512/128 real Fusion face-label smoke, uniform/unweighted outperformed class weights and naive face-balanced graph sampling. |
 
 ## Issues Encountered
 | Issue | Resolution |
 |-------|------------|
 | Git ownership protection prevents status checks | Continue without changing global config; mention in delivery. |
+| Naive face-balanced sampling hurt short-run validation metrics | Keep it as an opt-in coverage diagnostic; default to uniform train/val sampling until a face-budgeted sampler is implemented. |
 
 ## Resources
 - `task_plan.md`: task phase tracking.

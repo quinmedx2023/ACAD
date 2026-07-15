@@ -6,10 +6,21 @@ version = 4
 name = "acad-brep-candle-train"
 version = "0.1.0"
 dependencies = [
+ "acad-brep-dataset",
  "acad-brep-encoder",
  "acad-brep-graph",
  "candle-core",
  "candle-nn",
+ "serde_json",
+]
+
+[[package]]
+name = "acad-brep-dataset"
+version = "0.1.0"
+dependencies = [
+ "acad-brep-graph",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

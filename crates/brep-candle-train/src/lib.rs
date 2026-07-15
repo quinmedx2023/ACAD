@@ -16,8 +16,14 @@
 //! Ragged graphs are batched by concatenating nodes and offsetting the coedge
 //! index arrays, so a single forward pass covers a whole minibatch.
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 
+use acad_brep_dataset::{
+    load_manifest, load_metadata, load_samples, BrepSampleLabels, DatasetRecord, DatasetSplit,
+    CLASS_NAMES,
+};
 use acad_brep_encoder::{
     GraphTensorizer, GraphTensors, EDGE_CATEGORICAL_DIM, EDGE_GRID_CHANNELS, EDGE_SCALAR_DIM,
     FACE_CATEGORICAL_DIM, FACE_GRID_CHANNELS, FACE_SCALAR_DIM,
@@ -25,18 +31,15 @@ use acad_brep_encoder::{
 use acad_brep_graph::{box_graph, cylinder_graph, plate_with_holes, BrepGraph};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{
-    conv1d, conv2d, layer_norm, linear, loss, AdamW, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
-    LayerNorm, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap,
+    conv1d, conv2d, layer_norm, linear, loss, ops, AdamW, Conv1d, Conv1dConfig, Conv2d,
+    Conv2dConfig, LayerNorm, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap,
 };
 
-pub const CLASS_COUNT: usize = 3;
+pub const CLASS_COUNT: usize = CLASS_NAMES.len();
 /// Output width of each geometry conv front-end.
 pub const GEOM_OUT: usize = 32;
 const CONV_HIDDEN: usize = 16;
 const DTYPE: DType = DType::F32;
-
-/// Class labels for the synthetic dataset.
-pub const CLASS_NAMES: [&str; CLASS_COUNT] = ["box", "cylinder", "plate_with_holes"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct TrainingConfig {
@@ -75,6 +78,100 @@ pub struct TrainingReport {
     pub train_accuracy: f32,
     pub val_accuracy: f32,
     pub val_macro_f1: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FaceSegmentationConfig {
+    pub epochs: usize,
+    pub learning_rate: f64,
+    pub hidden_dim: usize,
+    pub rounds: usize,
+    pub seed: u64,
+    pub batch_size: usize,
+    /// Maximum train graph samples to load. `None` means all train samples.
+    pub max_train_samples: Option<usize>,
+    /// Maximum validation graph samples to load. `None` means all validation samples.
+    pub max_val_samples: Option<usize>,
+    pub use_class_weights: bool,
+    /// Sampling strategy for training records when a sample limit is set.
+    pub sampling_strategy: FaceSamplingStrategy,
+    /// Sampling strategy for validation records when a sample limit is set.
+    pub val_sampling_strategy: FaceSamplingStrategy,
+    pub shuffle_each_epoch: bool,
+}
+
+impl Default for FaceSegmentationConfig {
+    fn default() -> Self {
+        Self {
+            epochs: 5,
+            learning_rate: 0.003,
+            hidden_dim: 48,
+            rounds: 2,
+            seed: 42,
+            batch_size: 8,
+            max_train_samples: Some(1024),
+            max_val_samples: Some(256),
+            use_class_weights: false,
+            sampling_strategy: FaceSamplingStrategy::Uniform,
+            val_sampling_strategy: FaceSamplingStrategy::Uniform,
+            shuffle_each_epoch: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaceSamplingStrategy {
+    /// Deterministic evenly-spaced records from the manifest split.
+    Uniform,
+    /// Greedy graph selection that favors records containing underrepresented
+    /// face labels while preserving deterministic behavior.
+    FaceBalanced,
+}
+
+impl FaceSamplingStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::FaceBalanced => "face-balanced",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceSegmentationReport {
+    pub epochs: usize,
+    pub train_samples: usize,
+    pub val_samples: usize,
+    pub train_faces: usize,
+    pub val_faces: usize,
+    pub face_classes: usize,
+    pub hidden_dim: usize,
+    pub rounds: usize,
+    pub batch_size: usize,
+    pub class_weighting: bool,
+    pub sampling_strategy: FaceSamplingStrategy,
+    pub val_sampling_strategy: FaceSamplingStrategy,
+    pub shuffle_each_epoch: bool,
+    pub face_label_names: Vec<String>,
+    pub train_face_label_counts: Vec<usize>,
+    pub val_face_label_counts: Vec<usize>,
+    pub final_loss: f32,
+    pub train_accuracy: f32,
+    pub val_accuracy: f32,
+    pub val_macro_f1: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceSegmentationExample {
+    pub tensors: GraphTensors,
+    pub face_labels: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceSegmentationDataset {
+    pub train: Vec<FaceSegmentationExample>,
+    pub val: Vec<FaceSegmentationExample>,
+    pub label_names: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +228,312 @@ pub fn build_dataset(
         }
     }
     Ok((train, val))
+}
+
+/// Load a real on-disk dataset written by `acad-brep-dataset`.
+pub fn build_dataset_from_dir(
+    root: &Path,
+) -> Result<(Vec<(GraphTensors, u32)>, Vec<(GraphTensors, u32)>)> {
+    let tensorizer = GraphTensorizer::default();
+    let samples = load_samples(root).map_err(to_candle_error)?;
+    let mut train = Vec::new();
+    let mut val = Vec::new();
+
+    for sample in samples {
+        let tensors = tensorizer
+            .tensorize(&sample.graph)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        match sample.record.split {
+            DatasetSplit::Train => train.push((tensors, sample.labels.graph_class_id)),
+            DatasetSplit::Val => val.push((tensors, sample.labels.graph_class_id)),
+        }
+    }
+
+    Ok((train, val))
+}
+
+/// Load real face-segmentation examples from the on-disk dataset.
+///
+/// This reads only the selected manifest rows, so sampled training runs over
+/// large Fusion datasets do not need to materialize every graph first.
+pub fn build_face_segmentation_dataset(
+    root: &Path,
+    config: FaceSegmentationConfig,
+) -> Result<FaceSegmentationDataset> {
+    let metadata = load_metadata(root).map_err(to_candle_error)?;
+    if metadata.face_label_set.is_empty() {
+        return Err(candle_core::Error::Msg(
+            "dataset metadata has no face_label_set".to_string(),
+        ));
+    }
+
+    let label_to_id: BTreeMap<String, u32> = metadata
+        .face_label_set
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (label.clone(), index as u32))
+        .collect();
+
+    let records = load_manifest(root).map_err(to_candle_error)?;
+    let train_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.split == DatasetSplit::Train)
+        .collect();
+    let val_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.split == DatasetSplit::Val)
+        .collect();
+
+    let tensorizer = GraphTensorizer::default();
+    let train = load_face_examples(
+        root,
+        select_records_with_strategy(
+            root,
+            &train_records,
+            config.max_train_samples,
+            config.sampling_strategy,
+            &label_to_id,
+        )?,
+        &label_to_id,
+        &tensorizer,
+    )?;
+    let val = load_face_examples(
+        root,
+        select_records_with_strategy(
+            root,
+            &val_records,
+            config.max_val_samples,
+            config.val_sampling_strategy,
+            &label_to_id,
+        )?,
+        &label_to_id,
+        &tensorizer,
+    )?;
+
+    Ok(FaceSegmentationDataset {
+        train,
+        val,
+        label_names: metadata.face_label_set,
+    })
+}
+
+fn select_records_with_strategy<'a>(
+    root: &Path,
+    records: &'a [&'a DatasetRecord],
+    limit: Option<usize>,
+    strategy: FaceSamplingStrategy,
+    label_to_id: &BTreeMap<String, u32>,
+) -> Result<Vec<&'a DatasetRecord>> {
+    let effective = match limit {
+        Some(0) | None => records.len(),
+        Some(limit) => limit.min(records.len()),
+    };
+    if effective == records.len() {
+        return Ok(records.to_vec());
+    }
+    if effective == 0 {
+        return Ok(Vec::new());
+    }
+
+    match strategy {
+        FaceSamplingStrategy::Uniform => Ok(select_uniform_records(records, effective)),
+        FaceSamplingStrategy::FaceBalanced => {
+            select_face_balanced_records(root, records, effective, label_to_id)
+        }
+    }
+}
+
+fn select_uniform_records<'a>(
+    records: &'a [&'a DatasetRecord],
+    effective: usize,
+) -> Vec<&'a DatasetRecord> {
+    (0..effective)
+        .map(|index| records[index * records.len() / effective])
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct RecordFaceCounts {
+    index: usize,
+    counts: Vec<usize>,
+}
+
+fn select_face_balanced_records<'a>(
+    root: &Path,
+    records: &'a [&'a DatasetRecord],
+    effective: usize,
+    label_to_id: &BTreeMap<String, u32>,
+) -> Result<Vec<&'a DatasetRecord>> {
+    if label_to_id.is_empty() {
+        return Ok(select_uniform_records(records, effective));
+    }
+
+    let class_count = label_to_id.len();
+    let mut per_record = Vec::with_capacity(records.len());
+    let mut global_counts = vec![0usize; class_count];
+
+    for (index, record) in records.iter().enumerate() {
+        let counts = read_record_face_counts(root, record, label_to_id)?;
+        for (class, count) in counts.iter().enumerate() {
+            global_counts[class] += count;
+        }
+        per_record.push(RecordFaceCounts { index, counts });
+    }
+
+    let total_faces: usize = global_counts.iter().sum();
+    if total_faces == 0 {
+        return Ok(select_uniform_records(records, effective));
+    }
+
+    let mut inverse_global = vec![0.0f32; class_count];
+    let present = global_counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .count()
+        .max(1);
+    for (class, &count) in global_counts.iter().enumerate() {
+        if count > 0 {
+            inverse_global[class] = total_faces as f32 / (present as f32 * count as f32);
+        }
+    }
+
+    let mut selected = Vec::with_capacity(effective);
+    let mut selected_flags = vec![false; records.len()];
+    let mut selected_counts = vec![0usize; class_count];
+
+    while selected.len() < effective {
+        let mut best_index = None;
+        let mut best_score = f32::NEG_INFINITY;
+
+        for candidate in &per_record {
+            if selected_flags[candidate.index] {
+                continue;
+            }
+            let score = balanced_record_score(candidate, &selected_counts, &inverse_global);
+            if score > best_score {
+                best_score = score;
+                best_index = Some(candidate.index);
+            }
+        }
+
+        let Some(index) = best_index else {
+            break;
+        };
+        selected_flags[index] = true;
+        for (class, count) in per_record[index].counts.iter().enumerate() {
+            selected_counts[class] += count;
+        }
+        selected.push(records[index]);
+    }
+
+    selected.sort_by_key(|record| &record.id);
+    Ok(selected)
+}
+
+fn read_record_face_counts(
+    root: &Path,
+    record: &DatasetRecord,
+    label_to_id: &BTreeMap<String, u32>,
+) -> Result<Vec<usize>> {
+    let labels_json =
+        fs::read_to_string(root.join(&record.labels_path)).map_err(to_candle_error)?;
+    let labels: BrepSampleLabels = serde_json::from_str(&labels_json).map_err(to_candle_error)?;
+    let mut counts = vec![0usize; label_to_id.len()];
+    for label in labels.face_labels {
+        let label_id = label_to_id.get(&label).copied().ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "unknown face label {label:?} in sample {}",
+                record.id
+            ))
+        })? as usize;
+        counts[label_id] += 1;
+    }
+    Ok(counts)
+}
+
+fn balanced_record_score(
+    candidate: &RecordFaceCounts,
+    selected_counts: &[usize],
+    inverse_global: &[f32],
+) -> f32 {
+    let mut score = 0.0;
+    for (class, &count) in candidate.counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let selected = selected_counts[class] as f32;
+        score += inverse_global[class] * (count as f32).sqrt() / (selected + 1.0).sqrt();
+    }
+    score
+}
+
+fn load_face_examples(
+    root: &Path,
+    records: Vec<&DatasetRecord>,
+    label_to_id: &BTreeMap<String, u32>,
+    tensorizer: &GraphTensorizer,
+) -> Result<Vec<FaceSegmentationExample>> {
+    records
+        .into_iter()
+        .map(|record| load_face_example(root, record, label_to_id, tensorizer))
+        .collect()
+}
+
+fn load_face_example(
+    root: &Path,
+    record: &DatasetRecord,
+    label_to_id: &BTreeMap<String, u32>,
+    tensorizer: &GraphTensorizer,
+) -> Result<FaceSegmentationExample> {
+    let graph_json = fs::read_to_string(root.join(&record.graph_path)).map_err(to_candle_error)?;
+    let labels_json =
+        fs::read_to_string(root.join(&record.labels_path)).map_err(to_candle_error)?;
+    let graph = BrepGraph::from_json(&graph_json).map_err(to_candle_error)?;
+    graph.validate().map_err(to_candle_error)?;
+    let labels: BrepSampleLabels = serde_json::from_str(&labels_json).map_err(to_candle_error)?;
+
+    if labels.graph_class_id != record.class_id {
+        return Err(candle_core::Error::Msg(format!(
+            "graph class id mismatch for sample {}",
+            record.id
+        )));
+    }
+    if labels.face_labels.len() != graph.faces.len() {
+        return Err(candle_core::Error::Msg(format!(
+            "face label count mismatch for sample {}: labels={}, faces={}",
+            record.id,
+            labels.face_labels.len(),
+            graph.faces.len()
+        )));
+    }
+
+    let mut face_labels = Vec::with_capacity(labels.face_labels.len());
+    for label in labels.face_labels {
+        let label_id = label_to_id.get(&label).copied().ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "unknown face label {label:?} in sample {}",
+                record.id
+            ))
+        })?;
+        face_labels.push(label_id);
+    }
+
+    let tensors = tensorizer
+        .tensorize(&graph)
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+    if tensors.face_count != face_labels.len() {
+        return Err(candle_core::Error::Msg(format!(
+            "tensorized face count mismatch for sample {}: tensors={}, labels={}",
+            record.id,
+            tensors.face_count,
+            face_labels.len()
+        )));
+    }
+
+    Ok(FaceSegmentationExample {
+        tensors,
+        face_labels,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +635,40 @@ impl BrepBatch {
             face_graph: Tensor::from_vec(face_graph, total_faces, device)?,
             edge_graph: Tensor::from_vec(edge_graph, total_edges, device)?,
         })
+    }
+}
+
+pub struct FaceSegBatch {
+    pub batch: BrepBatch,
+    pub face_labels: Tensor,
+}
+
+impl FaceSegBatch {
+    pub fn from_examples(items: &[FaceSegmentationExample], device: &Device) -> Result<Self> {
+        if items.is_empty() {
+            return Err(candle_core::Error::Msg(
+                "face segmentation batch must contain at least one graph".to_string(),
+            ));
+        }
+
+        let mut tensors = Vec::with_capacity(items.len());
+        let mut labels = Vec::new();
+        for item in items {
+            if item.tensors.face_count != item.face_labels.len() {
+                return Err(candle_core::Error::Msg(format!(
+                    "face label count mismatch in batch: tensors={}, labels={}",
+                    item.tensors.face_count,
+                    item.face_labels.len()
+                )));
+            }
+            tensors.push(item.tensors.clone());
+            labels.extend_from_slice(&item.face_labels);
+        }
+
+        let batch = BrepBatch::from_graphs(&tensors, device)?;
+        let face_labels =
+            Tensor::from_vec(labels, batch.face_graph.dims1()?, device)?.to_dtype(DType::U32)?;
+        Ok(Self { batch, face_labels })
     }
 }
 
@@ -426,6 +863,31 @@ impl HybridBrepEncoder {
     }
 }
 
+pub struct FaceSegmentationModel {
+    pub encoder: HybridBrepEncoder,
+    face_head: Linear,
+}
+
+impl FaceSegmentationModel {
+    pub fn new(hidden: usize, rounds: usize, face_classes: usize, vb: VarBuilder) -> Result<Self> {
+        if face_classes == 0 {
+            return Err(candle_core::Error::Msg(
+                "face segmentation requires at least one class".to_string(),
+            ));
+        }
+        let encoder = HybridBrepEncoder::new(hidden, rounds, vb.pp("encoder"))?;
+        let face_head = linear(hidden, face_classes, vb.pp("face_head"))?;
+        Ok(Self { encoder, face_head })
+    }
+
+    pub fn forward_face_logits(&self, batch: &BrepBatch) -> Result<Tensor> {
+        self.encoder
+            .forward(batch)?
+            .face_embeddings
+            .apply(&self.face_head)
+    }
+}
+
 /// Segment-mean: average `src` rows into `num` groups given `index[row] -> group`.
 fn scatter_mean(src: &Tensor, index: &Tensor, num: usize) -> Result<Tensor> {
     let device = src.device();
@@ -453,8 +915,54 @@ pub fn train_synthetic_and_save(
     train_synthetic_with_optional_save(config, Some(save_path))
 }
 
+pub fn train_dataset(config: TrainingConfig, dataset_root: &Path) -> Result<TrainingReport> {
+    train_dataset_with_optional_save(config, dataset_root, None)
+}
+
+pub fn train_dataset_and_save(
+    config: TrainingConfig,
+    dataset_root: &Path,
+    save_path: &Path,
+) -> Result<TrainingReport> {
+    train_dataset_with_optional_save(config, dataset_root, Some(save_path))
+}
+
+pub fn train_face_segmentation(
+    config: FaceSegmentationConfig,
+    dataset_root: &Path,
+) -> Result<FaceSegmentationReport> {
+    train_face_segmentation_with_optional_save(config, dataset_root, None)
+}
+
+pub fn train_face_segmentation_and_save(
+    config: FaceSegmentationConfig,
+    dataset_root: &Path,
+    save_path: &Path,
+) -> Result<FaceSegmentationReport> {
+    train_face_segmentation_with_optional_save(config, dataset_root, Some(save_path))
+}
+
 fn train_synthetic_with_optional_save(
     config: TrainingConfig,
+    save_path: Option<&Path>,
+) -> Result<TrainingReport> {
+    let (train, val) = build_dataset(config.samples_per_class, config.val_fraction)?;
+    train_splits_with_optional_save(config, train, val, save_path)
+}
+
+fn train_dataset_with_optional_save(
+    config: TrainingConfig,
+    dataset_root: &Path,
+    save_path: Option<&Path>,
+) -> Result<TrainingReport> {
+    let (train, val) = build_dataset_from_dir(dataset_root)?;
+    train_splits_with_optional_save(config, train, val, save_path)
+}
+
+fn train_splits_with_optional_save(
+    config: TrainingConfig,
+    train: Vec<(GraphTensors, u32)>,
+    val: Vec<(GraphTensors, u32)>,
     save_path: Option<&Path>,
 ) -> Result<TrainingReport> {
     let device = Device::Cpu;
@@ -462,7 +970,6 @@ fn train_synthetic_with_optional_save(
     // so this is a no-op on CPU and only takes effect on CUDA.
     let _ = device.set_seed(config.seed);
 
-    let (train, val) = build_dataset(config.samples_per_class, config.val_fraction)?;
     let train_tensors: Vec<GraphTensors> = train.iter().map(|(t, _)| t.clone()).collect();
     let train_batch = BrepBatch::from_graphs(&train_tensors, &device)?;
     let train_labels = labels_tensor(&train, &device)?;
@@ -518,6 +1025,109 @@ fn train_synthetic_with_optional_save(
     })
 }
 
+fn train_face_segmentation_with_optional_save(
+    config: FaceSegmentationConfig,
+    dataset_root: &Path,
+    save_path: Option<&Path>,
+) -> Result<FaceSegmentationReport> {
+    let dataset = build_face_segmentation_dataset(dataset_root, config)?;
+    if dataset.train.is_empty() {
+        return Err(candle_core::Error::Msg(
+            "face segmentation dataset has no train samples".to_string(),
+        ));
+    }
+
+    let device = Device::Cpu;
+    let _ = device.set_seed(config.seed);
+    let face_classes = dataset.label_names.len();
+    let batch_size = config.batch_size.max(1);
+    let train_faces = count_faces(&dataset.train);
+    let val_faces = count_faces(&dataset.val);
+    let train_face_label_counts = face_label_counts(&dataset.train, face_classes);
+    let val_face_label_counts = face_label_counts(&dataset.val, face_classes);
+    let class_weights = if config.use_class_weights {
+        Some(Tensor::from_vec(
+            face_class_weights(&train_face_label_counts),
+            face_classes,
+            &device,
+        )?)
+    } else {
+        None
+    };
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DTYPE, &device);
+    let model = FaceSegmentationModel::new(config.hidden_dim, config.rounds, face_classes, vb)?;
+
+    let params = ParamsAdamW {
+        lr: config.learning_rate,
+        ..Default::default()
+    };
+    let mut optimizer = AdamW::new(varmap.all_vars(), params)?;
+
+    let mut final_loss = f32::NAN;
+    let mut train_order: Vec<usize> = (0..dataset.train.len()).collect();
+    for epoch in 0..config.epochs {
+        if config.shuffle_each_epoch {
+            deterministic_shuffle(
+                &mut train_order,
+                config.seed.wrapping_add(epoch as u64).wrapping_add(1),
+            );
+        }
+        for chunk in train_order.chunks(batch_size) {
+            let examples: Vec<_> = chunk
+                .iter()
+                .map(|&index| dataset.train[index].clone())
+                .collect();
+            let batch = FaceSegBatch::from_examples(&examples, &device)?;
+            let logits = model.forward_face_logits(&batch.batch)?;
+            let loss = if let Some(weights) = &class_weights {
+                weighted_cross_entropy(&logits, &batch.face_labels, weights)?
+            } else {
+                loss::cross_entropy(&logits, &batch.face_labels)?
+            };
+            final_loss = loss.to_scalar::<f32>()?;
+            optimizer.backward_step(&loss)?;
+        }
+    }
+
+    let (train_accuracy, _, _) =
+        evaluate_face_segmentation(&model, &dataset.train, batch_size, &device, face_classes)?;
+    let (val_accuracy, val_macro_f1, _) =
+        evaluate_face_segmentation(&model, &dataset.val, batch_size, &device, face_classes)?;
+
+    if let Some(save_path) = save_path {
+        varmap.save(save_path)?;
+    }
+
+    Ok(FaceSegmentationReport {
+        epochs: config.epochs,
+        train_samples: dataset.train.len(),
+        val_samples: dataset.val.len(),
+        train_faces,
+        val_faces,
+        face_classes,
+        hidden_dim: config.hidden_dim,
+        rounds: config.rounds,
+        batch_size,
+        class_weighting: config.use_class_weights,
+        sampling_strategy: config.sampling_strategy,
+        val_sampling_strategy: config.val_sampling_strategy,
+        shuffle_each_epoch: config.shuffle_each_epoch,
+        face_label_names: dataset.label_names,
+        train_face_label_counts,
+        val_face_label_counts,
+        final_loss,
+        train_accuracy,
+        val_accuracy,
+        val_macro_f1,
+    })
+}
+
+fn to_candle_error(error: impl std::error::Error) -> candle_core::Error {
+    candle_core::Error::Msg(error.to_string())
+}
+
 /// Load a checkpoint into a fresh encoder for inference.
 pub fn load_encoder(
     config: TrainingConfig,
@@ -536,6 +1146,106 @@ fn labels_tensor(items: &[(GraphTensors, u32)], device: &Device) -> Result<Tenso
     Tensor::from_vec(labels, items.len(), device)?.to_dtype(DType::U32)
 }
 
+fn weighted_cross_entropy(
+    logits: &Tensor,
+    labels: &Tensor,
+    class_weights: &Tensor,
+) -> Result<Tensor> {
+    if logits.rank() != 2 {
+        return Err(candle_core::Error::Msg(
+            "weighted_cross_entropy expects rank-2 logits".to_string(),
+        ));
+    }
+    let log_probs = ops::log_softmax(logits, 1)?;
+    let target_col = labels.unsqueeze(1)?;
+    let nll = log_probs.gather(&target_col, 1)?.neg()?;
+    let sample_weights = class_weights.index_select(labels, 0)?.unsqueeze(1)?;
+    let weighted = (&nll * &sample_weights)?;
+    let denominator = sample_weights.sum_all()?.clamp(1e-6, 1e9)?;
+    weighted.sum_all()?.broadcast_div(&denominator)
+}
+
+fn count_faces(items: &[FaceSegmentationExample]) -> usize {
+    items.iter().map(|item| item.face_labels.len()).sum()
+}
+
+fn face_label_counts(items: &[FaceSegmentationExample], class_count: usize) -> Vec<usize> {
+    let mut counts = vec![0; class_count];
+    for item in items {
+        for &label in &item.face_labels {
+            let label = label as usize;
+            if label < class_count {
+                counts[label] += 1;
+            }
+        }
+    }
+    counts
+}
+
+fn face_class_weights(counts: &[usize]) -> Vec<f32> {
+    let total: usize = counts.iter().sum();
+    let present = counts.iter().filter(|&&count| count > 0).count();
+    if total == 0 || present == 0 {
+        return vec![1.0; counts.len()];
+    }
+
+    counts
+        .iter()
+        .map(|&count| {
+            if count == 0 {
+                0.0
+            } else {
+                (total as f32 / (present as f32 * count as f32)).min(20.0)
+            }
+        })
+        .collect()
+}
+
+fn deterministic_shuffle(items: &mut [usize], seed: u64) {
+    if items.len() < 2 {
+        return;
+    }
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    for index in (1..items.len()).rev() {
+        let j = (next_u64(&mut state) as usize) % (index + 1);
+        items.swap(index, j);
+    }
+}
+
+fn next_u64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+}
+
+fn evaluate_face_segmentation(
+    model: &FaceSegmentationModel,
+    examples: &[FaceSegmentationExample],
+    batch_size: usize,
+    device: &Device,
+    class_count: usize,
+) -> Result<(f32, f32, usize)> {
+    if examples.is_empty() {
+        return Ok((f32::NAN, f32::NAN, 0));
+    }
+
+    let mut predictions = Vec::new();
+    let mut targets = Vec::new();
+    for chunk in examples.chunks(batch_size.max(1)) {
+        let batch = FaceSegBatch::from_examples(chunk, device)?;
+        let logits = model.forward_face_logits(&batch.batch)?;
+        predictions.extend(logits.argmax(D::Minus1)?.to_vec1::<u32>()?);
+        targets.extend(batch.face_labels.to_vec1::<u32>()?);
+    }
+
+    let accuracy = accuracy_from_predictions(&predictions, &targets);
+    let macro_f1 = macro_f1_from_predictions(&predictions, &targets, class_count);
+    Ok((accuracy, macro_f1, targets.len()))
+}
+
 fn accuracy(logits: &Tensor, labels: &Tensor) -> Result<f32> {
     let predictions = logits.argmax(D::Minus1)?;
     let correct = predictions
@@ -548,14 +1258,43 @@ fn accuracy(logits: &Tensor, labels: &Tensor) -> Result<f32> {
 
 /// Macro-averaged F1 over the classes present.
 fn macro_f1(logits: &Tensor, labels: &Tensor) -> Result<f32> {
+    macro_f1_for_classes(logits, labels, CLASS_COUNT)
+}
+
+fn macro_f1_for_classes(logits: &Tensor, labels: &Tensor, class_count: usize) -> Result<f32> {
     let predictions = logits.argmax(D::Minus1)?.to_vec1::<u32>()?;
     let targets = labels.to_vec1::<u32>()?;
+    Ok(macro_f1_from_predictions(
+        &predictions,
+        &targets,
+        class_count,
+    ))
+}
 
-    let mut tp = [0.0f32; CLASS_COUNT];
-    let mut fp = [0.0f32; CLASS_COUNT];
-    let mut fn_ = [0.0f32; CLASS_COUNT];
+fn accuracy_from_predictions(predictions: &[u32], targets: &[u32]) -> f32 {
+    if targets.is_empty() {
+        return f32::NAN;
+    }
+    let correct = predictions
+        .iter()
+        .zip(targets.iter())
+        .filter(|(pred, target)| pred == target)
+        .count();
+    correct as f32 / targets.len() as f32
+}
+
+fn macro_f1_from_predictions(predictions: &[u32], targets: &[u32], class_count: usize) -> f32 {
+    if class_count == 0 {
+        return f32::NAN;
+    }
+    let mut tp = vec![0.0f32; class_count];
+    let mut fp = vec![0.0f32; class_count];
+    let mut fn_ = vec![0.0f32; class_count];
     for (&pred, &target) in predictions.iter().zip(targets.iter()) {
         let (pred, target) = (pred as usize, target as usize);
+        if pred >= class_count || target >= class_count {
+            continue;
+        }
         if pred == target {
             tp[target] += 1.0;
         } else {
@@ -566,7 +1305,7 @@ fn macro_f1(logits: &Tensor, labels: &Tensor) -> Result<f32> {
 
     let mut f1_sum = 0.0;
     let mut counted = 0;
-    for class in 0..CLASS_COUNT {
+    for class in 0..class_count {
         if tp[class] + fp[class] + fn_[class] == 0.0 {
             continue; // class absent from this split
         }
@@ -580,11 +1319,11 @@ fn macro_f1(logits: &Tensor, labels: &Tensor) -> Result<f32> {
         f1_sum += f1;
         counted += 1;
     }
-    Ok(if counted == 0 {
+    if counted == 0 {
         0.0
     } else {
         f1_sum / counted as f32
-    })
+    }
 }
 
 fn safe_div(numerator: f32, denominator: f32) -> f32 {
@@ -605,6 +1344,67 @@ mod tests {
         assert!(!train.is_empty());
         assert!(!val.is_empty());
         assert_eq!(train.len() + val.len(), 8 * CLASS_COUNT);
+    }
+
+    #[test]
+    fn loads_dataset_from_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "acad-brep-candle-dataset-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        acad_brep_dataset::generate_synthetic_dataset(
+            &root,
+            acad_brep_dataset::DatasetConfig {
+                samples_per_class: 3,
+                val_fraction: 0.25,
+            },
+        )
+        .expect("dataset writes");
+
+        let (train, val) = build_dataset_from_dir(&root).expect("dataset loads");
+
+        assert_eq!(train.len() + val.len(), 9);
+        assert!(!train.is_empty());
+        assert!(!val.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loads_face_segmentation_dataset_from_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "acad-brep-face-dataset-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        acad_brep_dataset::generate_synthetic_dataset(
+            &root,
+            acad_brep_dataset::DatasetConfig {
+                samples_per_class: 2,
+                val_fraction: 0.25,
+            },
+        )
+        .expect("dataset writes");
+
+        let dataset = build_face_segmentation_dataset(
+            &root,
+            FaceSegmentationConfig {
+                max_train_samples: None,
+                max_val_samples: None,
+                ..Default::default()
+            },
+        )
+        .expect("face dataset loads");
+
+        assert!(!dataset.label_names.is_empty());
+        assert!(!dataset.train.is_empty());
+        assert!(dataset
+            .train
+            .iter()
+            .all(|item| item.tensors.face_count == item.face_labels.len()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -631,6 +1431,41 @@ mod tests {
         let outputs = model.forward(&batch).unwrap();
 
         assert_eq!(outputs.graph_logits.dims(), &[tensors.len(), CLASS_COUNT]);
+    }
+
+    #[test]
+    fn face_segmentation_training_smoke() {
+        let root =
+            std::env::temp_dir().join(format!("acad-brep-face-train-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        acad_brep_dataset::generate_synthetic_dataset(
+            &root,
+            acad_brep_dataset::DatasetConfig {
+                samples_per_class: 2,
+                val_fraction: 0.25,
+            },
+        )
+        .expect("dataset writes");
+
+        let report = train_face_segmentation(
+            FaceSegmentationConfig {
+                epochs: 1,
+                hidden_dim: 12,
+                rounds: 1,
+                batch_size: 2,
+                max_train_samples: None,
+                max_val_samples: None,
+                ..Default::default()
+            },
+            &root,
+        )
+        .expect("face segmentation training runs");
+
+        assert!(report.final_loss.is_finite());
+        assert!(report.train_faces > 0);
+        assert!(report.face_classes > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
