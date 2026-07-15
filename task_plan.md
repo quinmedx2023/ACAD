@@ -8,7 +8,7 @@ deployment inference. Proper training methodology (val split, seeding,
 normalization, F1, checkpoint load).
 
 ## Current Phase
-Phase K complete
+Phase L planning
 
 ## Phases
 
@@ -97,6 +97,15 @@ Phase K complete
 - [x] Clean clippy warnings in core vector math, tensor padding, and dataset loops.
 - [x] Update docs from `val_*` face-train terminology to `eval_*` where applicable.
 - **Status:** complete
+
+### Phase L: Dataset harness for real Fusion training
+- [ ] Define a reproducible dataset harness before changing samplers or model code.
+- [ ] Specify dataset versioning, source/raw fingerprinting, cleaner config, split provenance, and manifest validation.
+- [ ] Specify distribution diagnostics for graph/face/edge counts, class imbalance, rare-label coverage, and train/eval drift.
+- [ ] Specify evaluation artifacts: per-class precision/recall/F1/support, confusion matrix, and run metadata.
+- [ ] Specify sampler experiments under a fixed harness: graph-count, face-budget, rare-balanced, and overfit-small-subset checks.
+- [ ] Update docs and use the harness plan as the next implementation checklist.
+- **Status:** planning
 
 ## Decisions Made
 | Decision | Rationale |

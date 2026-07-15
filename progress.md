@@ -455,6 +455,16 @@ Candle-native per user request ("candle not OK?" → yes, Candle is capable).
 | 2026-07-15 | `onig_sys` could not find `vcruntime.h` | 1 | Set explicit VS2022 `PATH` and `INCLUDE` paths for cargo verification. |
 | 2026-07-15 | `git -c safe.directory=... status --short` warned about unreadable user git ignore | 1 | Noted only; command still listed generated files. |
 
+### Phase L: Face-data distribution, rare-class metrics, and sampling
+- **Status:** in_progress
+- Goal:
+  - Improve the training pipeline around real Fusion data distribution, rare labels, evaluation granularity, and sampling.
+- Initial scope:
+  - User redirected this phase to plan the dataset harness first.
+  - Added `docs/dataset_harness_plan.md` as the implementation blueprint.
+  - Reframed Phase L around dataset provenance, split validation, distribution diagnostics, sampler dry-runs, and per-class metrics.
+  - Keep model architecture and sampler implementation unchanged until the harness plan is accepted.
+
 ### Phase K: Simplification / over-design cleanup
 - **Status:** complete
 - Actions taken:
