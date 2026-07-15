@@ -1074,6 +1074,8 @@ fn train_face_segmentation_with_optional_save(
                 config.seed.wrapping_add(epoch as u64).wrapping_add(1),
             );
         }
+        let mut epoch_loss_sum = 0.0f32;
+        let mut epoch_batch_count = 0usize;
         for chunk in train_order.chunks(batch_size) {
             let examples: Vec<_> = chunk
                 .iter()
@@ -1086,8 +1088,12 @@ fn train_face_segmentation_with_optional_save(
             } else {
                 loss::cross_entropy(&logits, &batch.face_labels)?
             };
-            final_loss = loss.to_scalar::<f32>()?;
+            epoch_loss_sum += loss.to_scalar::<f32>()?;
+            epoch_batch_count += 1;
             optimizer.backward_step(&loss)?;
+        }
+        if epoch_batch_count > 0 {
+            final_loss = epoch_loss_sum / epoch_batch_count as f32;
         }
     }
 
@@ -1206,6 +1212,9 @@ fn deterministic_shuffle(items: &mut [usize], seed: u64) {
         return;
     }
     let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    if state == 0 {
+        state = 1;
+    }
     for index in (1..items.len()).rev() {
         let j = (next_u64(&mut state) as usize) % (index + 1);
         items.swap(index, j);

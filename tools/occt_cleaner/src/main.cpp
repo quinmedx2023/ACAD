@@ -1,9 +1,12 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepGProp.hxx>
+#include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <Geom_Surface.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <NCollection_IndexedDataMap.hxx>
 #include <NCollection_List.hxx>
@@ -26,7 +29,9 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -123,7 +128,7 @@ std::string json_escape(const std::string& value) {
     return out.str();
 }
 
-double finite(double value) {
+double sanitize_finite(double value) {
     if (!std::isfinite(value)) {
         return 0.0;
     }
@@ -131,7 +136,7 @@ double finite(double value) {
 }
 
 Vec3 vec3(const gp_Pnt& p) {
-    return {finite(p.X()), finite(p.Y()), finite(p.Z())};
+    return {sanitize_finite(p.X()), sanitize_finite(p.Y()), sanitize_finite(p.Z())};
 }
 
 Vec3 normalized(const gp_Vec& v, Vec3 fallback) {
@@ -139,12 +144,12 @@ Vec3 normalized(const gp_Vec& v, Vec3 fallback) {
     if (!std::isfinite(mag) || mag <= 1e-12) {
         return fallback;
     }
-    return {finite(v.X() / mag), finite(v.Y() / mag), finite(v.Z() / mag)};
+    return {sanitize_finite(v.X() / mag), sanitize_finite(v.Y() / mag), sanitize_finite(v.Z() / mag)};
 }
 
 std::pair<double, double> finite_range(double a, double b) {
-    a = finite(a);
-    b = finite(b);
+    a = sanitize_finite(a);
+    b = sanitize_finite(b);
     if (std::abs(a) > 1e6 || std::abs(b) > 1e6) {
         return {-1.0, 1.0};
     }
@@ -248,7 +253,7 @@ FaceJson face_to_json(const TopoDS_Face& face) {
     Vec3 normal = normal_at(surface, (u1 + u2) * 0.5, (v1 + v2) * 0.5, {0.0, 0.0, 1.0});
     FaceJson out;
     out.surface = surface_kind(surface.GetType());
-    out.area = finite(props.Mass());
+    out.area = sanitize_finite(props.Mass());
     out.centroid = vec3(props.CentreOfMass());
     out.normal = normal;
     out.geometry = sample_surface(surface, normal);
@@ -261,7 +266,7 @@ EdgeJson edge_to_json(const TopoDS_Edge& edge) {
     BRepGProp::LinearProperties(edge, props);
     EdgeJson out;
     out.curve = curve_kind(curve.GetType());
-    out.length = finite(props.Mass());
+    out.length = sanitize_finite(props.Mass());
     out.midpoint = vec3(props.CentreOfMass());
     out.geometry = sample_curve(curve);
     return out;
@@ -278,6 +283,82 @@ int find_index_ignore_orientation(const TopTools_IndexedMapOfShape& map, const T
         }
     }
     return -1;
+}
+
+std::string orientation_to_string(TopAbs_Orientation orientation) {
+    return orientation == TopAbs_REVERSED ? "Reversed" : "Forward";
+}
+
+/// Estimate the outward face normal near a 3D point by projecting the point
+/// onto the face's underlying surface and evaluating the surface normal
+/// there. Returns nullopt if projection fails or the local normal degenerates
+/// (e.g. at a singular point).
+std::optional<gp_Vec> face_normal_near(const TopoDS_Face& face, const gp_Pnt& point) {
+    Handle(Geom_Surface) surface = BRep_Tool::Surface(face);
+    if (surface.IsNull()) {
+        return std::nullopt;
+    }
+    GeomAPI_ProjectPointOnSurf projector(point, surface);
+    if (!projector.IsDone() || projector.NbPoints() < 1) {
+        return std::nullopt;
+    }
+    Standard_Real u = 0.0;
+    Standard_Real v = 0.0;
+    projector.LowerDistanceParameters(u, v);
+
+    gp_Pnt p;
+    gp_Vec du;
+    gp_Vec dv;
+    surface->D1(u, v, p, du, dv);
+    gp_Vec normal = du.Crossed(dv);
+    if (face.Orientation() == TopAbs_REVERSED) {
+        normal.Reverse();
+    }
+    if (normal.Magnitude() <= 1e-9) {
+        return std::nullopt;
+    }
+    normal.Normalize();
+    return normal;
+}
+
+/// Classify an edge shared by exactly two faces as convex, concave, or
+/// smooth (tangent), using the sign of the dihedral angle between the two
+/// faces' outward normals near the edge, taken consistently from the
+/// forward-oriented face to the reversed-oriented face so the label doesn't
+/// depend on arbitrary face indexing order. Falls back to "Unknown" when the
+/// edge's per-face orientations aren't a clean Forward/Reversed pair (e.g.
+/// non-manifold or seam edges) or when local geometry evaluation fails.
+std::string classify_convexity(
+    const TopoDS_Edge& edge,
+    const TopoDS_Face& forward_face,
+    const TopoDS_Face& reversed_face) {
+    BRepAdaptor_Curve curve(edge);
+    const auto [t1, t2] = finite_range(curve.FirstParameter(), curve.LastParameter());
+    gp_Pnt curve_point;
+    gp_Vec tangent;
+    try {
+        curve.D1((t1 + t2) * 0.5, curve_point, tangent);
+    } catch (...) {
+        return "Unknown";
+    }
+    if (tangent.Magnitude() <= 1e-9) {
+        return "Unknown";
+    }
+
+    auto forward_normal = face_normal_near(forward_face, curve_point);
+    auto reversed_normal = face_normal_near(reversed_face, curve_point);
+    if (!forward_normal || !reversed_normal) {
+        return "Unknown";
+    }
+
+    const double alignment = forward_normal->Dot(*reversed_normal);
+    if (alignment > 0.999) {
+        return "Smooth";
+    }
+
+    const gp_Vec cross = forward_normal->Crossed(*reversed_normal);
+    const double sign = cross.Dot(tangent);
+    return sign >= 0.0 ? "Convex" : "Concave";
 }
 
 GraphJson read_step_graph(const fs::path& path, bool allow_boundary) {
@@ -309,6 +390,24 @@ GraphJson read_step_graph(const fs::path& path, bool allow_boundary) {
         graph.edges.push_back(edge_to_json(TopoDS::Edge(edge_map(i))));
     }
 
+    // For each edge, record every (face, orientation-within-that-face's-wire)
+    // pair by walking each face's own wires directly. This gives the true
+    // per-face edge orientation, rather than assuming "Forward" everywhere.
+    std::vector<std::vector<std::pair<int, TopAbs_Orientation>>> edge_face_orientations(
+        graph.edges.size());
+    for (int face_i = 1; face_i <= face_map.Extent(); ++face_i) {
+        const int face_index = face_i - 1;
+        for (TopExp_Explorer explorer(face_map(face_i), TopAbs_EDGE); explorer.More();
+             explorer.Next()) {
+            const TopoDS_Edge& face_edge = TopoDS::Edge(explorer.Current());
+            const int edge_index = find_index_ignore_orientation(edge_map, face_edge);
+            if (edge_index >= 0) {
+                edge_face_orientations[edge_index].emplace_back(
+                    face_index, face_edge.Orientation());
+            }
+        }
+    }
+
     std::vector<std::vector<int>> coedges_by_edge(graph.edges.size());
     for (int edge_i = 1; edge_i <= edge_map.Extent(); ++edge_i) {
         const int edge_index = edge_i - 1;
@@ -329,9 +428,43 @@ GraphJson read_step_graph(const fs::path& path, bool allow_boundary) {
                     << " incident faces";
             throw std::runtime_error(message.str());
         }
+
+        // Determine convexity once per edge using the canonical
+        // (forward-face, reversed-face) pair, if the edge cleanly has one of
+        // each; this keeps the convex/concave label independent of the
+        // arbitrary ordering of `incident_faces`.
+        std::string convexity = "Unknown";
+        const auto& orientations = edge_face_orientations[edge_index];
+        if (incident_faces.size() == 2) {
+            const int* forward_index = nullptr;
+            const int* reversed_index = nullptr;
+            for (const auto& [face_index, orientation] : orientations) {
+                if (orientation == TopAbs_FORWARD && forward_index == nullptr) {
+                    forward_index = &face_index;
+                } else if (orientation == TopAbs_REVERSED && reversed_index == nullptr) {
+                    reversed_index = &face_index;
+                }
+            }
+            if (forward_index != nullptr && reversed_index != nullptr &&
+                *forward_index != *reversed_index) {
+                convexity = classify_convexity(
+                    TopoDS::Edge(edge),
+                    TopoDS::Face(face_map(*forward_index + 1)),
+                    TopoDS::Face(face_map(*reversed_index + 1)));
+            }
+        }
+        graph.edges[edge_index].convexity = convexity;
+
         for (int face_index : incident_faces) {
+            std::string orientation_label = "Forward";
+            for (const auto& [candidate_index, candidate_orientation] : orientations) {
+                if (candidate_index == face_index) {
+                    orientation_label = orientation_to_string(candidate_orientation);
+                    break;
+                }
+            }
             const int coedge_index = static_cast<int>(graph.coedges.size());
-            graph.coedges.push_back({edge_index, face_index, "Forward", std::nullopt});
+            graph.coedges.push_back({edge_index, face_index, orientation_label, std::nullopt});
             coedges_by_edge[edge_index].push_back(coedge_index);
         }
         if (incident_faces.size() >= 2) {
@@ -460,6 +593,7 @@ void write_vec3_array(std::ostream& out, const std::vector<Vec3>& values) {
 
 void write_graph(const fs::path& path, const GraphJson& graph) {
     std::ofstream out(path);
+    out << std::setprecision(std::numeric_limits<double>::max_digits10);
     out << "{\n\"faces\":[";
     for (std::size_t i = 0; i < graph.faces.size(); ++i) {
         const FaceJson& f = graph.faces[i];
@@ -517,6 +651,7 @@ void write_graph(const fs::path& path, const GraphJson& graph) {
 
 void write_labels(const fs::path& path, const std::vector<int>& seg, const GraphJson& graph) {
     std::ofstream out(path);
+    out << std::setprecision(std::numeric_limits<double>::max_digits10);
     out << "{\n\"graph_class_id\":0,\n\"graph_class_name\":\"fusion_part\",\n\"face_labels\":[";
     for (std::size_t i = 0; i < seg.size(); ++i) {
         if (i) out << ",";

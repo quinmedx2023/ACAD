@@ -110,7 +110,16 @@ else()
   find_package(OpenCASCADE REQUIRED)
   set(_OCCT_INCLUDE_DIRS ${OpenCASCADE_INCLUDE_DIR} ${OpenCASCADE_INCLUDE_DIRS})
   set(_OCCT_LINK_DIRS)
+  # This tool is a headless STEP -> BRep-graph converter and never touches
+  # OCCT's DRAW/visualization toolkits. Distro OCCT packages (e.g. Debian/
+  # Ubuntu libocct-*) report those toolkits in OpenCASCADE_LIBRARIES, which
+  # in turn pull in Tk/Tcl/OpenGL dev libraries. Systems without those dev
+  # packages installed (common on minimal CI/build images) then fail to
+  # link this tool for no reason related to its actual dependencies, so
+  # they're filtered out here.
   set(_OCCT_LIBS ${OpenCASCADE_LIBRARIES})
+  list(FILTER _OCCT_LIBS EXCLUDE REGEX
+       "Draw|OpenGl|V3d|Service|MeshVS|ViewerTest|QADraw|TopTest|XDEDRAW|XSDRAW|TObjDRAW|DCAF")
 endif()
 
 add_executable(occt_cleaner src/main.cpp)
