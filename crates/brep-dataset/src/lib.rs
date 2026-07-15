@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use acad_brep_graph::{
@@ -26,10 +26,14 @@ use serde::{Deserialize, Serialize};
 pub const DATASET_VERSION: &str = "acad-brep-dataset-v1";
 pub const MANIFEST_FILE: &str = "manifest.jsonl";
 pub const DATASET_FILE: &str = "dataset.json";
+pub const HARNESS_FILE: &str = "harness.json";
+pub const HARNESS_VERSION: &str = "acad-brep-dataset-harness-v1";
 pub const GRAPHS_DIR: &str = "graphs";
 pub const LABELS_DIR: &str = "labels";
 
 pub const CLASS_NAMES: [&str; 3] = ["box", "cylinder", "plate_with_holes"];
+
+type LabelCounts = BTreeMap<String, usize>;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DatasetConfig {
@@ -112,6 +116,84 @@ pub struct DatasetSummary {
     pub class_counts: BTreeMap<String, usize>,
     pub face_label_counts: BTreeMap<String, usize>,
     pub edge_label_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HarnessConfig {
+    pub validation_percent: u8,
+    pub validation_seed: u64,
+    pub rare_count_threshold: usize,
+    pub rare_fraction_threshold: f32,
+    pub split_file: Option<PathBuf>,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            validation_percent: 10,
+            validation_seed: 42,
+            rare_count_threshold: 1000,
+            rare_fraction_threshold: 0.005,
+            split_file: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DatasetHarnessReport {
+    pub harness_version: String,
+    pub dataset_version: String,
+    pub manifest_hash: String,
+    pub split_file_hash: Option<String>,
+    pub split_policy: HarnessSplitPolicy,
+    pub record_counts_by_split: BTreeMap<String, usize>,
+    pub face_label_counts_by_split: BTreeMap<String, BTreeMap<String, usize>>,
+    pub edge_label_counts_by_split: BTreeMap<String, BTreeMap<String, usize>>,
+    pub graph_face_stats_by_split: BTreeMap<String, CountStats>,
+    pub rare_face_label_policy: RareLabelPolicy,
+    pub rare_face_labels: Vec<String>,
+    pub labels_missing_from_train_inner: Vec<String>,
+    pub labels_missing_from_val_inner: Vec<String>,
+    pub train_val_label_drift: LabelDriftReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessSplitPolicy {
+    pub validation_source: String,
+    pub validation_percent: u8,
+    pub validation_seed: u64,
+    pub test_policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountStats {
+    pub count: usize,
+    pub total: usize,
+    pub min: usize,
+    pub p50: usize,
+    pub p90: usize,
+    pub p95: usize,
+    pub p99: usize,
+    pub max: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RareLabelPolicy {
+    pub count_lt: usize,
+    pub fraction_lt: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelDriftReport {
+    pub total_variation: Option<f32>,
+    pub labels: BTreeMap<String, LabelDrift>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelDrift {
+    pub train_fraction: f32,
+    pub val_fraction: f32,
+    pub train_to_val_ratio: Option<f32>,
 }
 
 pub fn generate_synthetic_dataset(
@@ -266,6 +348,164 @@ pub fn summarize_dataset(root: impl AsRef<Path>) -> Result<DatasetSummary, Datas
     summarize_records(root, metadata, records)
 }
 
+pub fn inspect_dataset_harness(
+    root: impl AsRef<Path>,
+    config: HarnessConfig,
+) -> Result<DatasetHarnessReport, DatasetError> {
+    let root = root.as_ref();
+    let metadata = load_metadata(root)?;
+    if metadata.version != DATASET_VERSION {
+        return Err(DatasetError::InvalidDataset {
+            reason: format!(
+                "unsupported dataset version {:?}; expected {DATASET_VERSION:?}",
+                metadata.version
+            ),
+        });
+    }
+
+    let records = load_manifest(root)?;
+    let manifest_hash = hash_file_hex(root.join(MANIFEST_FILE))?;
+    let split_file_hash = config
+        .split_file
+        .as_deref()
+        .map(hash_file_hex)
+        .transpose()?;
+    let has_manifest_val = records
+        .iter()
+        .any(|record| record.split == DatasetSplit::Val);
+    let has_manifest_test = records
+        .iter()
+        .any(|record| record.split == DatasetSplit::Test);
+    let validation_source = if has_manifest_val {
+        "manifest_val"
+    } else {
+        "hash_from_manifest_train"
+    };
+
+    let mut record_counts_by_split = BTreeMap::new();
+    let mut face_label_counts_by_split: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut edge_label_counts_by_split: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut face_counts_by_split: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+    for record in &records {
+        let split = harness_split_name(record, has_manifest_val, &config);
+        *record_counts_by_split.entry(split.clone()).or_insert(0) += 1;
+        face_counts_by_split
+            .entry(split.clone())
+            .or_default()
+            .push(record.stats.faces);
+
+        let (face_counts, edge_counts) = record_label_counts(root, record)?;
+        add_counts(
+            face_label_counts_by_split.entry(split.clone()).or_default(),
+            &face_counts,
+        );
+        add_counts(
+            edge_label_counts_by_split.entry(split).or_default(),
+            &edge_counts,
+        );
+    }
+
+    let mut graph_face_stats_by_split = BTreeMap::new();
+    for (split, counts) in face_counts_by_split {
+        graph_face_stats_by_split.insert(split, count_stats(counts));
+    }
+
+    let train_counts = face_label_counts_by_split
+        .get("train_inner")
+        .cloned()
+        .unwrap_or_default();
+    let val_counts = face_label_counts_by_split
+        .get("val_inner")
+        .cloned()
+        .unwrap_or_default();
+    let global_counts = sum_nested_counts(&face_label_counts_by_split);
+    let total_faces: usize = global_counts.values().sum();
+    let rare_face_labels = rare_labels(
+        &global_counts,
+        total_faces,
+        config.rare_count_threshold,
+        config.rare_fraction_threshold,
+    );
+    let labels_missing_from_train_inner = missing_labels(&global_counts, &train_counts);
+    let labels_missing_from_val_inner = missing_labels(&global_counts, &val_counts);
+    let train_val_label_drift = label_drift_report(&train_counts, &val_counts);
+
+    Ok(DatasetHarnessReport {
+        harness_version: HARNESS_VERSION.to_string(),
+        dataset_version: metadata.version,
+        manifest_hash,
+        split_file_hash,
+        split_policy: HarnessSplitPolicy {
+            validation_source: validation_source.to_string(),
+            validation_percent: if has_manifest_val {
+                0
+            } else {
+                config.validation_percent
+            },
+            validation_seed: config.validation_seed,
+            test_policy: if has_manifest_test {
+                "manifest_test_reserved".to_string()
+            } else {
+                "no_manifest_test".to_string()
+            },
+        },
+        record_counts_by_split,
+        face_label_counts_by_split,
+        edge_label_counts_by_split,
+        graph_face_stats_by_split,
+        rare_face_label_policy: RareLabelPolicy {
+            count_lt: config.rare_count_threshold,
+            fraction_lt: config.rare_fraction_threshold,
+        },
+        rare_face_labels,
+        labels_missing_from_train_inner,
+        labels_missing_from_val_inner,
+        train_val_label_drift,
+    })
+}
+
+pub fn write_dataset_harness(
+    root: impl AsRef<Path>,
+    config: HarnessConfig,
+    out: Option<&Path>,
+) -> Result<DatasetHarnessReport, DatasetError> {
+    let root = root.as_ref();
+    let report = inspect_dataset_harness(root, config)?;
+    let out = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join(HARNESS_FILE));
+    fs::write(out, serde_json::to_string_pretty(&report)?)?;
+    Ok(report)
+}
+
+pub fn manifest_hash(root: impl AsRef<Path>) -> Result<String, DatasetError> {
+    hash_file_hex(root.as_ref().join(MANIFEST_FILE))
+}
+
+pub fn hash_strings_hex(values: &[String]) -> String {
+    let mut hash = FNV_OFFSET;
+    for value in values {
+        hash = fnv1a_update(hash, value.as_bytes());
+        hash = fnv1a_update(hash, &[0]);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn hash_file_hex(path: impl AsRef<Path>) -> Result<String, DatasetError> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = FNV_OFFSET;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash = fnv1a_update(hash, &buffer[..read]);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
 fn summarize_records(
     root: &Path,
     metadata: DatasetMetadata,
@@ -306,6 +546,166 @@ fn summarize_records(
     })
 }
 
+fn harness_split_name(
+    record: &DatasetRecord,
+    has_manifest_val: bool,
+    config: &HarnessConfig,
+) -> String {
+    match record.split {
+        DatasetSplit::Train if !has_manifest_val => {
+            if config.validation_percent > 0
+                && id_percent(&record.id, config.validation_seed) < config.validation_percent
+            {
+                "val_inner"
+            } else {
+                "train_inner"
+            }
+        }
+        DatasetSplit::Train => "train_inner",
+        DatasetSplit::Val => "val_inner",
+        DatasetSplit::Test => "test_final",
+    }
+    .to_string()
+}
+
+fn record_label_counts(
+    root: &Path,
+    record: &DatasetRecord,
+) -> Result<(LabelCounts, LabelCounts), DatasetError> {
+    if !record.face_label_counts.is_empty() && !record.edge_label_counts.is_empty() {
+        return Ok((
+            record.face_label_counts.clone(),
+            record.edge_label_counts.clone(),
+        ));
+    }
+
+    let labels_json = fs::read_to_string(root.join(&record.labels_path))?;
+    let labels: BrepSampleLabels = serde_json::from_str(&labels_json)?;
+    Ok((
+        count_strings(&labels.face_labels),
+        count_strings(&labels.edge_labels),
+    ))
+}
+
+fn count_stats(mut values: Vec<usize>) -> CountStats {
+    if values.is_empty() {
+        return CountStats {
+            count: 0,
+            total: 0,
+            min: 0,
+            p50: 0,
+            p90: 0,
+            p95: 0,
+            p99: 0,
+            max: 0,
+        };
+    }
+    values.sort_unstable();
+    let total = values.iter().sum();
+    CountStats {
+        count: values.len(),
+        total,
+        min: values[0],
+        p50: percentile(&values, 50),
+        p90: percentile(&values, 90),
+        p95: percentile(&values, 95),
+        p99: percentile(&values, 99),
+        max: values[values.len() - 1],
+    }
+}
+
+fn percentile(sorted: &[usize], percentile: usize) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[index.min(sorted.len() - 1)]
+}
+
+fn sum_nested_counts(
+    splits: &BTreeMap<String, BTreeMap<String, usize>>,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for split_counts in splits.values() {
+        add_counts(&mut counts, split_counts);
+    }
+    counts
+}
+
+fn rare_labels(
+    counts: &BTreeMap<String, usize>,
+    total: usize,
+    count_threshold: usize,
+    fraction_threshold: f32,
+) -> Vec<String> {
+    counts
+        .iter()
+        .filter_map(|(label, &count)| {
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                count as f32 / total as f32
+            };
+            (count < count_threshold || fraction < fraction_threshold).then(|| label.clone())
+        })
+        .collect()
+}
+
+fn missing_labels(
+    global_counts: &BTreeMap<String, usize>,
+    split_counts: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    global_counts
+        .keys()
+        .filter(|label| !split_counts.contains_key(*label))
+        .cloned()
+        .collect()
+}
+
+fn label_drift_report(
+    train_counts: &BTreeMap<String, usize>,
+    val_counts: &BTreeMap<String, usize>,
+) -> LabelDriftReport {
+    let train_total: usize = train_counts.values().sum();
+    let val_total: usize = val_counts.values().sum();
+    let mut labels = BTreeMap::new();
+    let mut tv = 0.0f32;
+
+    for label in train_counts.keys().chain(val_counts.keys()) {
+        if labels.contains_key(label) {
+            continue;
+        }
+        let train_fraction = fraction(*train_counts.get(label).unwrap_or(&0), train_total);
+        let val_fraction = fraction(*val_counts.get(label).unwrap_or(&0), val_total);
+        tv += (train_fraction - val_fraction).abs();
+        labels.insert(
+            label.clone(),
+            LabelDrift {
+                train_fraction,
+                val_fraction,
+                train_to_val_ratio: if val_fraction == 0.0 {
+                    None
+                } else {
+                    Some(train_fraction / val_fraction)
+                },
+            },
+        );
+    }
+
+    LabelDriftReport {
+        total_variation: (train_total > 0 && val_total > 0).then_some(tv * 0.5),
+        labels,
+    }
+}
+
+fn fraction(count: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f32 / total as f32
+    }
+}
+
 fn write_manifest(path: PathBuf, records: &[DatasetRecord]) -> Result<(), DatasetError> {
     let mut file = fs::File::create(path)?;
     for record in records {
@@ -326,6 +726,23 @@ fn add_counts(target: &mut BTreeMap<String, usize>, counts: &BTreeMap<String, us
     for (label, count) in counts {
         *target.entry(label.clone()).or_insert(0) += count;
     }
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn id_percent(id: &str, seed: u64) -> u8 {
+    let mut hash = fnv1a_update(FNV_OFFSET, &seed.to_le_bytes());
+    hash = fnv1a_update(hash, id.as_bytes());
+    (hash % 100) as u8
 }
 
 fn validation_stride(val_fraction: f32) -> usize {
@@ -401,6 +818,7 @@ pub enum DatasetError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Graph(GraphError),
+    InvalidDataset { reason: String },
     InvalidLabels { id: String, reason: String },
 }
 
@@ -410,6 +828,7 @@ impl fmt::Display for DatasetError {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Json(error) => write!(formatter, "JSON error: {error}"),
             Self::Graph(error) => write!(formatter, "invalid BRep graph: {error}"),
+            Self::InvalidDataset { reason } => write!(formatter, "invalid dataset: {reason}"),
             Self::InvalidLabels { id, reason } => {
                 write!(formatter, "invalid labels for sample {id}: {reason}")
             }
@@ -480,5 +899,132 @@ mod tests {
         assert_eq!(loaded_summary.metadata.records, 9);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writes_dataset_harness_report() {
+        let root =
+            std::env::temp_dir().join(format!("acad-brep-harness-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        generate_synthetic_dataset(
+            &root,
+            DatasetConfig {
+                samples_per_class: 4,
+                val_fraction: 0.25,
+            },
+        )
+        .expect("dataset writes");
+
+        let report = write_dataset_harness(
+            &root,
+            HarnessConfig {
+                rare_count_threshold: 2,
+                rare_fraction_threshold: 0.01,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("harness writes");
+
+        assert_eq!(report.harness_version, HARNESS_VERSION);
+        assert_eq!(report.dataset_version, DATASET_VERSION);
+        assert_eq!(report.manifest_hash.len(), 16);
+        assert_eq!(report.split_policy.validation_source, "manifest_val");
+        assert!(report.record_counts_by_split.contains_key("train_inner"));
+        assert!(report.record_counts_by_split.contains_key("val_inner"));
+        assert!(report
+            .train_val_label_drift
+            .total_variation
+            .is_some_and(|value| value >= 0.0));
+        assert!(root.join(HARNESS_FILE).is_file());
+
+        let loaded: DatasetHarnessReport =
+            serde_json::from_str(&fs::read_to_string(root.join(HARNESS_FILE)).unwrap()).unwrap();
+        assert_eq!(loaded.manifest_hash, report.manifest_hash);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn harness_hash_split_carves_validation_from_train_and_preserves_test() {
+        let records = vec![
+            DatasetRecord {
+                id: "a".to_string(),
+                split: DatasetSplit::Train,
+                class_id: 0,
+                class_name: "part".to_string(),
+                graph_path: "graphs/a.json".to_string(),
+                labels_path: "labels/a.json".to_string(),
+                stats: GraphStats {
+                    faces: 1,
+                    edges: 0,
+                    coedges: 0,
+                    face_adjacencies: 0,
+                },
+                face_label_counts: BTreeMap::from([("rare".to_string(), 1)]),
+                edge_label_counts: BTreeMap::from([("edge".to_string(), 0)]),
+            },
+            DatasetRecord {
+                id: "b".to_string(),
+                split: DatasetSplit::Train,
+                class_id: 0,
+                class_name: "part".to_string(),
+                graph_path: "graphs/b.json".to_string(),
+                labels_path: "labels/b.json".to_string(),
+                stats: GraphStats {
+                    faces: 3,
+                    edges: 0,
+                    coedges: 0,
+                    face_adjacencies: 0,
+                },
+                face_label_counts: BTreeMap::from([("common".to_string(), 3)]),
+                edge_label_counts: BTreeMap::from([("edge".to_string(), 0)]),
+            },
+            DatasetRecord {
+                id: "c".to_string(),
+                split: DatasetSplit::Test,
+                class_id: 0,
+                class_name: "part".to_string(),
+                graph_path: "graphs/c.json".to_string(),
+                labels_path: "labels/c.json".to_string(),
+                stats: GraphStats {
+                    faces: 2,
+                    edges: 0,
+                    coedges: 0,
+                    face_adjacencies: 0,
+                },
+                face_label_counts: BTreeMap::from([("common".to_string(), 2)]),
+                edge_label_counts: BTreeMap::from([("edge".to_string(), 0)]),
+            },
+        ];
+        let config = HarnessConfig {
+            validation_percent: 100,
+            validation_seed: 7,
+            rare_count_threshold: 2,
+            rare_fraction_threshold: 0.0,
+            split_file: None,
+        };
+
+        assert_eq!(harness_split_name(&records[0], false, &config), "val_inner");
+        assert_eq!(
+            harness_split_name(&records[2], false, &config),
+            "test_final"
+        );
+
+        let mut split_counts = BTreeMap::new();
+        for record in &records {
+            let split = harness_split_name(record, false, &config);
+            let (face_counts, _) = record_label_counts(Path::new("."), record).unwrap();
+            add_counts(split_counts.entry(split).or_default(), &face_counts);
+        }
+        let global = sum_nested_counts(&split_counts);
+        assert_eq!(rare_labels(&global, 6, 2, 0.0), vec!["rare"]);
+
+        let empty = BTreeMap::new();
+        let drift = label_drift_report(
+            split_counts.get("train_inner").unwrap_or(&empty),
+            split_counts.get("val_inner").unwrap_or(&empty),
+        );
+        assert!(drift.total_variation.is_none());
     }
 }

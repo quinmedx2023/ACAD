@@ -8,7 +8,7 @@ deployment inference. Proper training methodology (val split, seeding,
 normalization, F1, checkpoint load).
 
 ## Current Phase
-Phase L planning
+Phase L V2 complete; V3 pending
 
 ## Phases
 
@@ -99,13 +99,14 @@ Phase L planning
 - **Status:** complete
 
 ### Phase L: Dataset harness for real Fusion training
-- [ ] Define a reproducible dataset harness before changing samplers or model code.
-- [ ] Specify dataset versioning, source/raw fingerprinting, cleaner config, split provenance, and manifest validation.
-- [ ] Specify distribution diagnostics for graph/face/edge counts, class imbalance, rare-label coverage, and train/eval drift.
-- [ ] Specify evaluation artifacts: per-class precision/recall/F1/support, confusion matrix, and run metadata.
-- [ ] Specify sampler experiments under a fixed harness: graph-count, face-budget, rare-balanced, and overfit-small-subset checks.
-- [ ] Update docs and use the harness plan as the next implementation checklist.
-- **Status:** planning
+- [x] Define validation/test discipline before changing samplers or model code.
+- [x] Split harness implementation into V0 policy, V1 inspect, V2 training report, V3 sampler dry-run, and V4 sampler implementation.
+- [x] V1 minimal harness report: manifest hash, split policy, label histograms, rare-label set, and drift score.
+- [x] V2 `face-train --report`: run provenance plus per-class F1 and IoU.
+- [ ] V3 sampler dry-runs with selected ID hashes before training with new samplers.
+- [x] Keep run directories, generated markdown, and multi-seed automation as later work.
+- [x] Update docs and use the harness plan as the next implementation checklist.
+- **Status:** in_progress
 
 ## Decisions Made
 | Decision | Rationale |

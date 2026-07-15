@@ -21,8 +21,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use acad_brep_dataset::{
-    load_manifest, load_metadata, load_samples, BrepSampleLabels, DatasetRecord, DatasetSplit,
-    CLASS_NAMES,
+    hash_strings_hex, load_manifest, load_metadata, load_samples, BrepSampleLabels, DatasetRecord,
+    DatasetSplit, CLASS_NAMES,
 };
 use acad_brep_encoder::{
     GraphTensorizer, GraphTensors, EDGE_CATEGORICAL_DIM, EDGE_GRID_CHANNELS, EDGE_SCALAR_DIM,
@@ -152,14 +152,45 @@ pub struct FaceSegmentationReport {
     pub face_label_names: Vec<String>,
     pub train_face_label_counts: Vec<usize>,
     pub eval_face_label_counts: Vec<usize>,
+    pub train_record_ids_hash: String,
+    pub eval_record_ids_hash: String,
     pub final_loss: f32,
     pub train_accuracy: f32,
     pub eval_accuracy: f32,
     pub eval_macro_f1: f32,
+    pub train_metrics: FaceEvaluationMetrics,
+    pub eval_metrics: FaceEvaluationMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaceEvaluationMetrics {
+    pub accuracy: f32,
+    pub macro_f1: f32,
+    pub weighted_f1: f32,
+    pub macro_iou: f32,
+    pub macro_iou_present: f32,
+    pub support: usize,
+    pub class_metrics: Vec<FaceClassMetric>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaceClassMetric {
+    pub class_id: usize,
+    pub label: String,
+    pub support: usize,
+    pub predicted: usize,
+    pub true_positives: usize,
+    pub false_positives: usize,
+    pub false_negatives: usize,
+    pub precision: f32,
+    pub recall: f32,
+    pub f1: f32,
+    pub iou: f32,
 }
 
 #[derive(Debug, Clone)]
 pub struct FaceSegmentationExample {
+    pub record_id: String,
     pub tensors: GraphTensors,
     pub face_labels: Vec<u32>,
 }
@@ -544,6 +575,7 @@ fn load_face_example(
     }
 
     Ok(FaceSegmentationExample {
+        record_id: record.id.clone(),
         tensors,
         face_labels,
     })
@@ -1064,6 +1096,8 @@ fn train_face_segmentation_with_optional_save(
     let eval_faces = count_faces(&dataset.eval);
     let train_face_label_counts = face_label_counts(&dataset.train, face_classes);
     let eval_face_label_counts = face_label_counts(&dataset.eval, face_classes);
+    let train_record_ids_hash = record_ids_hash(&dataset.train);
+    let eval_record_ids_hash = record_ids_hash(&dataset.eval);
     let class_weights = if config.use_class_weights {
         Some(Tensor::from_vec(
             face_class_weights(&train_face_label_counts),
@@ -1116,10 +1150,20 @@ fn train_face_segmentation_with_optional_save(
         }
     }
 
-    let (train_accuracy, _, _) =
-        evaluate_face_segmentation(&model, &dataset.train, batch_size, &device, face_classes)?;
-    let (eval_accuracy, eval_macro_f1, _) =
-        evaluate_face_segmentation(&model, &dataset.eval, batch_size, &device, face_classes)?;
+    let train_metrics = evaluate_face_segmentation(
+        &model,
+        &dataset.train,
+        batch_size,
+        &device,
+        &dataset.label_names,
+    )?;
+    let eval_metrics = evaluate_face_segmentation(
+        &model,
+        &dataset.eval,
+        batch_size,
+        &device,
+        &dataset.label_names,
+    )?;
 
     if let Some(save_path) = save_path {
         varmap.save(save_path)?;
@@ -1140,10 +1184,14 @@ fn train_face_segmentation_with_optional_save(
         face_label_names: dataset.label_names,
         train_face_label_counts,
         eval_face_label_counts,
+        train_record_ids_hash,
+        eval_record_ids_hash,
         final_loss,
-        train_accuracy,
-        eval_accuracy,
-        eval_macro_f1,
+        train_accuracy: train_metrics.accuracy,
+        eval_accuracy: eval_metrics.accuracy,
+        eval_macro_f1: eval_metrics.macro_f1,
+        train_metrics,
+        eval_metrics,
     })
 }
 
@@ -1292,6 +1340,11 @@ fn face_label_counts(items: &[FaceSegmentationExample], class_count: usize) -> V
     counts
 }
 
+fn record_ids_hash(items: &[FaceSegmentationExample]) -> String {
+    let ids: Vec<String> = items.iter().map(|item| item.record_id.clone()).collect();
+    hash_strings_hex(&ids)
+}
+
 fn face_class_weights(counts: &[usize]) -> Vec<f32> {
     let total: usize = counts.iter().sum();
     let present = counts.iter().filter(|&&count| count > 0).count();
@@ -1339,10 +1392,10 @@ fn evaluate_face_segmentation(
     examples: &[FaceSegmentationExample],
     batch_size: usize,
     device: &Device,
-    class_count: usize,
-) -> Result<(f32, f32, usize)> {
+    label_names: &[String],
+) -> Result<FaceEvaluationMetrics> {
     if examples.is_empty() {
-        return Ok((f32::NAN, f32::NAN, 0));
+        return Ok(face_metrics_from_predictions(&[], &[], label_names));
     }
 
     let mut predictions = Vec::new();
@@ -1354,9 +1407,11 @@ fn evaluate_face_segmentation(
         targets.extend(batch.face_labels.to_vec1::<u32>()?);
     }
 
-    let accuracy = accuracy_from_predictions(&predictions, &targets);
-    let macro_f1 = macro_f1_from_predictions(&predictions, &targets, class_count);
-    Ok((accuracy, macro_f1, targets.len()))
+    Ok(face_metrics_from_predictions(
+        &predictions,
+        &targets,
+        label_names,
+    ))
 }
 
 fn accuracy(logits: &Tensor, labels: &Tensor) -> Result<f32> {
@@ -1396,34 +1451,139 @@ fn accuracy_from_predictions(predictions: &[u32], targets: &[u32]) -> f32 {
     correct as f32 / targets.len() as f32
 }
 
-fn macro_f1_from_predictions(predictions: &[u32], targets: &[u32], class_count: usize) -> f32 {
-    if class_count == 0 {
-        return f32::NAN;
-    }
-    let mut tp = vec![0.0f32; class_count];
-    let mut fp = vec![0.0f32; class_count];
-    let mut fn_ = vec![0.0f32; class_count];
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassPredictionStats {
+    support: usize,
+    predicted: usize,
+    true_positives: usize,
+    false_positives: usize,
+    false_negatives: usize,
+}
+
+fn class_prediction_stats(
+    predictions: &[u32],
+    targets: &[u32],
+    class_count: usize,
+) -> Vec<ClassPredictionStats> {
+    let mut stats = vec![ClassPredictionStats::default(); class_count];
     for (&pred, &target) in predictions.iter().zip(targets.iter()) {
         let (pred, target) = (pred as usize, target as usize);
+        if target < class_count {
+            stats[target].support += 1;
+        }
+        if pred < class_count {
+            stats[pred].predicted += 1;
+        }
         if pred >= class_count || target >= class_count {
             continue;
         }
         if pred == target {
-            tp[target] += 1.0;
+            stats[target].true_positives += 1;
         } else {
-            fp[pred] += 1.0;
-            fn_[target] += 1.0;
+            stats[pred].false_positives += 1;
+            stats[target].false_negatives += 1;
         }
     }
+    stats
+}
 
+fn face_metrics_from_predictions(
+    predictions: &[u32],
+    targets: &[u32],
+    label_names: &[String],
+) -> FaceEvaluationMetrics {
+    let stats = class_prediction_stats(predictions, targets, label_names.len());
+    let mut class_metrics = Vec::with_capacity(label_names.len());
+    let mut macro_f1_sum = 0.0;
+    let mut macro_f1_count = 0usize;
+    let mut weighted_f1_sum = 0.0;
+    let mut macro_iou_sum = 0.0;
+    let mut macro_iou_present_sum = 0.0;
+    let mut macro_iou_present_count = 0usize;
+    let total_support: usize = stats.iter().map(|item| item.support).sum();
+
+    for (class_id, (label, stats)) in label_names.iter().zip(stats.iter()).enumerate() {
+        let tp = stats.true_positives as f32;
+        let fp = stats.false_positives as f32;
+        let fn_ = stats.false_negatives as f32;
+        let precision = safe_div(tp, tp + fp);
+        let recall = safe_div(tp, tp + fn_);
+        let f1 = if precision + recall == 0.0 {
+            0.0
+        } else {
+            2.0 * precision * recall / (precision + recall)
+        };
+        let iou = safe_div(tp, tp + fp + fn_);
+
+        if stats.true_positives + stats.false_positives + stats.false_negatives > 0 {
+            macro_f1_sum += f1;
+            macro_f1_count += 1;
+        }
+        weighted_f1_sum += f1 * stats.support as f32;
+        macro_iou_sum += iou;
+        if stats.support > 0 {
+            macro_iou_present_sum += iou;
+            macro_iou_present_count += 1;
+        }
+
+        class_metrics.push(FaceClassMetric {
+            class_id,
+            label: label.clone(),
+            support: stats.support,
+            predicted: stats.predicted,
+            true_positives: stats.true_positives,
+            false_positives: stats.false_positives,
+            false_negatives: stats.false_negatives,
+            precision,
+            recall,
+            f1,
+            iou,
+        });
+    }
+
+    FaceEvaluationMetrics {
+        accuracy: accuracy_from_predictions(predictions, targets),
+        macro_f1: if macro_f1_count == 0 {
+            0.0
+        } else {
+            macro_f1_sum / macro_f1_count as f32
+        },
+        weighted_f1: if total_support == 0 {
+            0.0
+        } else {
+            weighted_f1_sum / total_support as f32
+        },
+        macro_iou: if label_names.is_empty() {
+            0.0
+        } else {
+            macro_iou_sum / label_names.len() as f32
+        },
+        macro_iou_present: if macro_iou_present_count == 0 {
+            0.0
+        } else {
+            macro_iou_present_sum / macro_iou_present_count as f32
+        },
+        support: total_support,
+        class_metrics,
+    }
+}
+
+fn macro_f1_from_predictions(predictions: &[u32], targets: &[u32], class_count: usize) -> f32 {
+    if class_count == 0 {
+        return f32::NAN;
+    }
+    let stats = class_prediction_stats(predictions, targets, class_count);
     let mut f1_sum = 0.0;
     let mut counted = 0;
-    for class in 0..class_count {
-        if tp[class] + fp[class] + fn_[class] == 0.0 {
+    for stats in stats {
+        if stats.true_positives + stats.false_positives + stats.false_negatives == 0 {
             continue; // class absent from this split
         }
-        let precision = safe_div(tp[class], tp[class] + fp[class]);
-        let recall = safe_div(tp[class], tp[class] + fn_[class]);
+        let tp = stats.true_positives as f32;
+        let fp = stats.false_positives as f32;
+        let fn_ = stats.false_negatives as f32;
+        let precision = safe_div(tp, tp + fp);
+        let recall = safe_div(tp, tp + fn_);
         let f1 = if precision + recall == 0.0 {
             0.0
         } else {
@@ -1579,6 +1739,28 @@ mod tests {
         assert!(report.face_classes > 0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn face_metrics_report_per_class_f1_and_iou() {
+        let labels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let predictions = vec![0, 1, 1, 2, 2, 2];
+        let targets = vec![0, 0, 1, 1, 2, 2];
+
+        let metrics = face_metrics_from_predictions(&predictions, &targets, &labels);
+
+        assert_eq!(metrics.support, 6);
+        assert!((metrics.accuracy - 4.0 / 6.0).abs() < 1e-6);
+        assert!((metrics.class_metrics[0].precision - 1.0).abs() < 1e-6);
+        assert!((metrics.class_metrics[0].recall - 0.5).abs() < 1e-6);
+        assert!((metrics.class_metrics[0].f1 - 2.0 / 3.0).abs() < 1e-6);
+        assert!((metrics.class_metrics[0].iou - 0.5).abs() < 1e-6);
+        assert_eq!(metrics.class_metrics[1].true_positives, 1);
+        assert_eq!(metrics.class_metrics[1].false_positives, 1);
+        assert_eq!(metrics.class_metrics[1].false_negatives, 1);
+        assert!((metrics.class_metrics[2].precision - 2.0 / 3.0).abs() < 1e-6);
+        assert!(metrics.macro_f1 > 0.0);
+        assert!(metrics.macro_iou_present > 0.0);
     }
 
     #[test]

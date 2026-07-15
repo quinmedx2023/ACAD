@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use acad_brep_candle_train::{
@@ -11,8 +12,10 @@ use acad_brep_candle_train::{
     TrainingReport,
 };
 use acad_brep_dataset::{
-    generate_synthetic_dataset, summarize_dataset, DatasetConfig, DatasetSplit, DatasetSummary,
+    generate_synthetic_dataset, manifest_hash, summarize_dataset, write_dataset_harness,
+    DatasetConfig, DatasetHarnessReport, DatasetSplit, DatasetSummary, HarnessConfig,
 };
+use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
@@ -34,6 +37,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             let summary = summarize_dataset(&data)?;
             println!("BRep dataset: {}", data.display());
             print_summary(&summary);
+        }
+        Some("inspect-harness") => {
+            let args = parse_harness_args(args);
+            let report = run_inspect_harness(args)?;
+            print_harness_report(&report);
         }
         Some("clean-fusion") => {
             let args = parse_clean_fusion_args(args);
@@ -80,6 +88,7 @@ struct FaceTrainArgs {
     config: FaceSegmentationConfig,
     data: PathBuf,
     save: Option<PathBuf>,
+    report: Option<PathBuf>,
 }
 
 struct CleanFusionArgs {
@@ -90,6 +99,52 @@ struct CleanFusionArgs {
     use_default_split_file: bool,
     limit: Option<usize>,
     allow_boundary: bool,
+}
+
+struct HarnessArgs {
+    data: PathBuf,
+    out: Option<PathBuf>,
+    config: HarnessConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct FaceTrainJsonReport {
+    report_version: &'static str,
+    git_commit: Option<String>,
+    git_dirty: Option<bool>,
+    dataset_path: String,
+    manifest_hash: Option<String>,
+    config: FaceTrainConfigReport,
+    sampler: FaceTrainSamplerReport,
+    final_loss: f32,
+    train_metrics: acad_brep_candle_train::FaceEvaluationMetrics,
+    eval_metrics: acad_brep_candle_train::FaceEvaluationMetrics,
+}
+
+#[derive(Debug, Serialize)]
+struct FaceTrainConfigReport {
+    epochs: usize,
+    learning_rate: f64,
+    hidden_dim: usize,
+    rounds: usize,
+    seed: u64,
+    batch_size: usize,
+    max_train_samples: Option<usize>,
+    max_eval_samples: Option<usize>,
+    use_class_weights: bool,
+    sampling_strategy: String,
+    eval_split: String,
+    shuffle_each_epoch: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FaceTrainSamplerReport {
+    train_record_ids_hash: String,
+    eval_record_ids_hash: String,
+    train_samples: usize,
+    eval_samples: usize,
+    train_faces: usize,
+    eval_faces: usize,
 }
 
 fn parse_dataset_args(args: impl Iterator<Item = String>) -> DatasetArgs {
@@ -134,6 +189,45 @@ fn parse_inspect_args(args: impl Iterator<Item = String>) -> PathBuf {
         }
     }
     data
+}
+
+fn parse_harness_args(args: impl Iterator<Item = String>) -> HarnessArgs {
+    let mut data = PathBuf::from("data/fusion-seg-v1");
+    let mut out = None;
+    let mut config = HarnessConfig::default();
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data" => data = PathBuf::from(next_string(&mut args, "--data")),
+            "--out" => out = Some(PathBuf::from(next_string(&mut args, "--out"))),
+            "--val-percent" => config.validation_percent = parse_next(&mut args, "--val-percent"),
+            "--seed" => config.validation_seed = parse_next(&mut args, "--seed"),
+            "--rare-count" => config.rare_count_threshold = parse_next(&mut args, "--rare-count"),
+            "--rare-fraction" => {
+                config.rare_fraction_threshold = parse_next(&mut args, "--rare-fraction")
+            }
+            "--split-file" => {
+                config.split_file = Some(PathBuf::from(next_string(&mut args, "--split-file")))
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            unknown => die_unknown(unknown),
+        }
+    }
+
+    if config.validation_percent > 100 {
+        eprintln!("invalid value for --val-percent: expected 0..100");
+        std::process::exit(2);
+    }
+    if config.rare_fraction_threshold < 0.0 {
+        eprintln!("invalid value for --rare-fraction: expected a non-negative number");
+        std::process::exit(2);
+    }
+
+    HarnessArgs { data, out, config }
 }
 
 fn parse_clean_fusion_args(args: impl Iterator<Item = String>) -> CleanFusionArgs {
@@ -219,6 +313,7 @@ fn parse_face_train_args(args: impl Iterator<Item = String>) -> FaceTrainArgs {
     let mut config = FaceSegmentationConfig::default();
     let mut data = PathBuf::from("data/fusion-seg-v1");
     let mut save = None;
+    let mut report = None;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
@@ -253,6 +348,7 @@ fn parse_face_train_args(args: impl Iterator<Item = String>) -> FaceTrainArgs {
             }
             "--no-shuffle" => config.shuffle_each_epoch = false,
             "--save" => save = Some(PathBuf::from(next_string(&mut args, "--save"))),
+            "--report" => report = Some(PathBuf::from(next_string(&mut args, "--report"))),
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -261,7 +357,12 @@ fn parse_face_train_args(args: impl Iterator<Item = String>) -> FaceTrainArgs {
         }
     }
 
-    FaceTrainArgs { config, data, save }
+    FaceTrainArgs {
+        config,
+        data,
+        save,
+        report,
+    }
 }
 
 fn run_clean_fusion(args: CleanFusionArgs) -> Result<(), Box<dyn Error>> {
@@ -530,10 +631,87 @@ fn run_train(args: TrainArgs) -> candle_core::Result<TrainingReport> {
 }
 
 fn run_face_train(args: FaceTrainArgs) -> candle_core::Result<FaceSegmentationReport> {
-    match args.save {
+    let report = match args.save {
         Some(save) => train_face_segmentation_and_save(args.config, &args.data, &save),
         None => train_face_segmentation(args.config, &args.data),
+    }?;
+    if let Some(path) = args.report {
+        write_face_train_report(&path, args.config, &args.data, &report)?;
     }
+    Ok(report)
+}
+
+fn run_inspect_harness(args: HarnessArgs) -> Result<DatasetHarnessReport, Box<dyn Error>> {
+    let report = write_dataset_harness(&args.data, args.config, args.out.as_deref())?;
+    Ok(report)
+}
+
+fn write_face_train_report(
+    path: &Path,
+    config: FaceSegmentationConfig,
+    data: &Path,
+    report: &FaceSegmentationReport,
+) -> candle_core::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(to_candle_error)?;
+    }
+    let json_report = FaceTrainJsonReport {
+        report_version: "acad-brep-face-train-report-v1",
+        git_commit: git_output(["rev-parse", "HEAD"]),
+        git_dirty: git_output(["status", "--porcelain"]).map(|output| !output.trim().is_empty()),
+        dataset_path: data.display().to_string(),
+        manifest_hash: manifest_hash(data).ok(),
+        config: FaceTrainConfigReport {
+            epochs: config.epochs,
+            learning_rate: config.learning_rate,
+            hidden_dim: config.hidden_dim,
+            rounds: config.rounds,
+            seed: config.seed,
+            batch_size: config.batch_size,
+            max_train_samples: config.max_train_samples,
+            max_eval_samples: config.max_eval_samples,
+            use_class_weights: config.use_class_weights,
+            sampling_strategy: config.sampling_strategy.as_str().to_string(),
+            eval_split: config.eval_split.as_str().to_string(),
+            shuffle_each_epoch: config.shuffle_each_epoch,
+        },
+        sampler: FaceTrainSamplerReport {
+            train_record_ids_hash: report.train_record_ids_hash.clone(),
+            eval_record_ids_hash: report.eval_record_ids_hash.clone(),
+            train_samples: report.train_samples,
+            eval_samples: report.eval_samples,
+            train_faces: report.train_faces,
+            eval_faces: report.eval_faces,
+        },
+        final_loss: report.final_loss,
+        train_metrics: report.train_metrics.clone(),
+        eval_metrics: report.eval_metrics.clone(),
+    };
+    let json = serde_json::to_string_pretty(&json_report).map_err(to_candle_error)?;
+    fs::write(path, json).map_err(to_candle_error)
+}
+
+fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
+    let safe_directory = format!(
+        "safe.directory={}",
+        env::current_dir()
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let output = Command::new("git")
+        .arg("-c")
+        .arg(safe_directory)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn print_report(report: &TrainingReport) {
@@ -573,6 +751,14 @@ fn print_face_report(report: &FaceSegmentationReport) {
     println!("train_face_accuracy: {:.2}%", report.train_accuracy * 100.0);
     println!("eval_face_accuracy: {:.2}%", report.eval_accuracy * 100.0);
     println!("eval_face_macro_f1: {:.4}", report.eval_macro_f1);
+    println!(
+        "eval_face_weighted_f1: {:.4}",
+        report.eval_metrics.weighted_f1
+    );
+    println!(
+        "eval_face_macro_iou: {:.4}",
+        report.eval_metrics.macro_iou_present
+    );
 }
 
 fn print_summary(summary: &DatasetSummary) {
@@ -585,6 +771,33 @@ fn print_summary(summary: &DatasetSummary) {
     println!("edge_labels: {:?}", summary.edge_label_counts);
 }
 
+fn print_harness_report(report: &DatasetHarnessReport) {
+    println!("Dataset harness report written");
+    println!("harness_version: {}", report.harness_version);
+    println!("dataset_version: {}", report.dataset_version);
+    println!("manifest_hash: {}", report.manifest_hash);
+    println!(
+        "split_policy: validation_source={}, validation_percent={}, test_policy={}",
+        report.split_policy.validation_source,
+        report.split_policy.validation_percent,
+        report.split_policy.test_policy
+    );
+    println!("record_counts: {:?}", report.record_counts_by_split);
+    println!("rare_face_labels: {:?}", report.rare_face_labels);
+    println!(
+        "train_val_total_variation: {:?}",
+        report.train_val_label_drift.total_variation
+    );
+    println!(
+        "missing_from_train_inner: {:?}",
+        report.labels_missing_from_train_inner
+    );
+    println!(
+        "missing_from_val_inner: {:?}",
+        report.labels_missing_from_val_inner
+    );
+}
+
 fn parse_next<T>(args: &mut impl Iterator<Item = String>, name: &str) -> T
 where
     T: std::str::FromStr,
@@ -594,6 +807,10 @@ where
         eprintln!("invalid value for {name}: {value}");
         std::process::exit(2);
     })
+}
+
+fn to_candle_error(error: impl std::error::Error) -> candle_core::Error {
+    candle_core::Error::Msg(error.to_string())
 }
 
 fn parse_optional_limit(value: usize) -> Option<usize> {
@@ -654,6 +871,8 @@ fn print_help() {
         "Usage:\n  \
          brep-candle-train dataset [--out DIR] [--samples-per-class N] [--val-fraction F]\n  \
          brep-candle-train inspect [--data DIR]\n  \
+         brep-candle-train inspect-harness [--data DIR] [--out PATH] [--val-percent N] \
+         [--seed N] [--rare-count N] [--rare-fraction F] [--split-file PATH]\n  \
          brep-candle-train clean-fusion --raw DIR [--out DIR] [--exe PATH] [--split-file PATH] \
          [--no-split-file] [--limit N] [--allow-boundary]\n  \
          brep-candle-train train [--data DIR] [--epochs N] [--lr LR] [--hidden N] \
@@ -662,7 +881,7 @@ fn print_help() {
          [--rounds N] [--seed N] [--batch-size N] [--max-train-samples N] \
          [--max-eval-samples N] [--sample-strategy uniform|face-balanced] \
          [--class-weights] [--no-class-weights] [--eval-split val|test] \
-         [--no-shuffle] [--save PATH]\n\n  \
+         [--no-shuffle] [--save PATH] [--report PATH]\n\n  \
          Without a subcommand, training uses the in-memory synthetic dataset for backward compatibility."
     );
 }

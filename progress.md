@@ -464,6 +464,24 @@ Candle-native per user request ("candle not OK?" → yes, Candle is capable).
   - Added `docs/dataset_harness_plan.md` as the implementation blueprint.
   - Reframed Phase L around dataset provenance, split validation, distribution diagnostics, sampler dry-runs, and per-class metrics.
   - Keep model architecture and sampler implementation unchanged until the harness plan is accepted.
+  - Tightened the plan to avoid over-design: V1 uses one `harness.json`, optional `face-train --report`, manifest hash, frozen rare-label set, IoU/F1 metrics, and sampler dry-runs. Run directory trees, generated markdown, and multi-seed automation are later work.
+  - Split the harness plan into V0 policy, V1 dataset inspect, V2 training report, V3 sampler dry-run, and V4 sampler implementation so each version can land independently.
+  - Implemented V1 `inspect-harness`:
+    - writes a single JSON harness report;
+    - records manifest hash, optional split-file hash, split policy, record counts, label histograms, graph face-count percentiles, frozen rare-label policy, missing labels, and train/val total variation drift;
+    - reads only `dataset.json`, `manifest.jsonl`, and label files only for old manifests without label-count columns.
+  - Implemented V2 `face-train --report`:
+    - writes one JSON report;
+    - records git commit/dirty flag, resolved config, dataset manifest hash, selected train/eval ID hashes, final loss, train metrics, eval metrics, and per-class precision/recall/F1/IoU.
+  - Console face-train output now includes eval weighted-F1 and macro-IoU.
+- Verification:
+  - `cargo fmt --all` passed.
+  - `cargo test --workspace` passed: 24 unit tests plus doc tests.
+  - `cargo clippy --workspace -- -D warnings` passed.
+  - `inspect-harness --data data\synthetic-v1 --out target\synthetic-harness.json --rare-count 2` passed.
+  - `face-train --data data\synthetic-v1 --epochs 1 --rounds 1 --hidden 16 --batch-size 2 --max-train-samples 4 --max-eval-samples 2 --report target\synthetic-face-report.json` passed and wrote per-class IoU.
+  - `inspect-harness --data data\fusion-seg-v1-100 --out target\fusion-100-harness.json --rare-count 20` passed and surfaced `segment_5` as missing from `val_inner`.
+  - Added focused tests for hash-based inner validation split/test preservation, rare-label/drift helpers, and per-class F1/IoU arithmetic.
 
 ### Phase K: Simplification / over-design cleanup
 - **Status:** complete
