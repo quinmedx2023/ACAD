@@ -62,6 +62,17 @@ pub struct DatasetMetadata {
 pub enum DatasetSplit {
     Train,
     Val,
+    Test,
+}
+
+impl DatasetSplit {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Train => "train",
+            Self::Val => "val",
+            Self::Test => "test",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +84,10 @@ pub struct DatasetRecord {
     pub graph_path: String,
     pub labels_path: String,
     pub stats: GraphStats,
+    #[serde(default)]
+    pub face_label_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub edge_label_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,9 +129,8 @@ pub fn generate_synthetic_dataset(
     let mut edge_label_set = BTreeMap::new();
     let stride = validation_stride(config.val_fraction);
 
-    for class_id in 0..CLASS_NAMES.len() {
+    for (class_id, &class_name) in CLASS_NAMES.iter().enumerate() {
         for index in 0..config.samples_per_class {
-            let class_name = CLASS_NAMES[class_id];
             let sample_index = class_id * config.samples_per_class + index;
             let split = if sample_index % stride == stride - 1 {
                 DatasetSplit::Val
@@ -163,6 +177,8 @@ pub fn generate_synthetic_dataset(
                 graph_path,
                 labels_path,
                 stats,
+                face_label_counts: count_strings(&labels.face_labels),
+                edge_label_counts: count_strings(&labels.edge_labels),
             });
         }
     }
@@ -261,20 +277,23 @@ fn summarize_records(
     let mut edge_label_counts = BTreeMap::new();
 
     for record in &records {
-        let split = match record.split {
-            DatasetSplit::Train => "train",
-            DatasetSplit::Val => "val",
-        };
-        *split_counts.entry(split.to_string()).or_insert(0) += 1;
+        *split_counts
+            .entry(record.split.as_str().to_string())
+            .or_insert(0) += 1;
         *class_counts.entry(record.class_name.clone()).or_insert(0) += 1;
 
-        let labels_json = fs::read_to_string(root.join(&record.labels_path))?;
-        let labels: BrepSampleLabels = serde_json::from_str(&labels_json)?;
-        for label in labels.face_labels {
-            *face_label_counts.entry(label).or_insert(0) += 1;
-        }
-        for label in labels.edge_labels {
-            *edge_label_counts.entry(label).or_insert(0) += 1;
+        if !record.face_label_counts.is_empty() && !record.edge_label_counts.is_empty() {
+            add_counts(&mut face_label_counts, &record.face_label_counts);
+            add_counts(&mut edge_label_counts, &record.edge_label_counts);
+        } else {
+            let labels_json = fs::read_to_string(root.join(&record.labels_path))?;
+            let labels: BrepSampleLabels = serde_json::from_str(&labels_json)?;
+            for label in labels.face_labels {
+                *face_label_counts.entry(label).or_insert(0) += 1;
+            }
+            for label in labels.edge_labels {
+                *edge_label_counts.entry(label).or_insert(0) += 1;
+            }
         }
     }
 
@@ -293,6 +312,20 @@ fn write_manifest(path: PathBuf, records: &[DatasetRecord]) -> Result<(), Datase
         writeln!(file, "{}", serde_json::to_string(record)?)?;
     }
     Ok(())
+}
+
+fn count_strings(values: &[String]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for value in values {
+        *counts.entry(value.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn add_counts(target: &mut BTreeMap<String, usize>, counts: &BTreeMap<String, usize>) {
+    for (label, count) in counts {
+        *target.entry(label.clone()).or_insert(0) += count;
+    }
 }
 
 fn validation_stride(val_fraction: f32) -> usize {
@@ -407,6 +440,15 @@ impl From<GraphError> for DatasetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dataset_split_preserves_test() {
+        let json = serde_json::to_string(&DatasetSplit::Test).expect("split serializes");
+        assert_eq!(json, "\"test\"");
+        let split: DatasetSplit = serde_json::from_str(&json).expect("split deserializes");
+        assert_eq!(split, DatasetSplit::Test);
+        assert_eq!(split.as_str(), "test");
+    }
 
     #[test]
     fn generates_loads_and_summarizes_dataset() {

@@ -91,6 +91,18 @@ cargo run -p acad-brep-candle-train -- clean-fusion `
   --allow-boundary
 ```
 
+When `data/s2.0.1_extended_step/train_test.json` is present, the Rust wrapper
+passes it to the sidecar automatically. Fusion `train` ids stay `train`; Fusion
+`test` ids stay `test`. Override this with `--split-file <path>`, or disable it
+with `--no-split-file` to return to deterministic modulo splitting.
+
+Split files are strict: duplicate ids or STEP files missing from the split file
+fail the cleanup instead of silently falling back to modulo assignment.
+
+The generated manifest also includes `face_label_counts` and
+`edge_label_counts` per record. This keeps face-balanced sampling diagnostics
+from reparsing all label JSON files on each training run.
+
 The Rust wrapper defaults to:
 
 ```text
@@ -131,59 +143,73 @@ cargo run -p acad-brep-candle-train -- face-train `
   --hidden 32 `
   --batch-size 8 `
   --max-train-samples 512 `
-  --max-val-samples 128 `
+  --max-eval-samples 128 `
+  --eval-split test `
   --save target/fusion-face-seg-smoke.safetensors
 ```
+
+The graph tensorizer normalizes geometry per solid by default: it centers each
+graph on its bounding-box center and scales coordinates and lengths by the
+largest bbox extent. The source JSON remains in CAD units; normalization is
+applied only to training tensors.
+
+When `--save` is used, `face-train` writes both the `.safetensors` weights and a
+`*.metadata.json` sidecar containing the face-label vocabulary and model shape
+needed to interpret the checkpoint.
 
 `face-train` uses `labels/*.json` face labels as the supervised target. The
 default config uses uniform manifest sampling plus deterministic per-epoch
 shuffle, instead of loading all 42,912 cleaned graphs. Pass
-`--max-train-samples 0 --max-val-samples 0` for a full in-memory run.
+`--max-train-samples 0 --max-eval-samples 0` for a full in-memory run.
+
+For regenerated official Fusion datasets, use `--eval-split test` intentionally.
+The default `--eval-split val` is retained for synthetic or custom datasets with
+a validation split and fails clearly when no validation rows exist.
 
 Optional imbalance controls:
 
 ```powershell
 --class-weights
 --sample-strategy face-balanced
---val-sample-strategy face-balanced
 ```
 
-The face-balanced selector is useful for coverage diagnostics, but it changes
-the sampled training distribution. Keep validation uniform unless deliberately
-stress-testing rare labels.
+The face-balanced selector is useful for train coverage diagnostics, but it
+changes the sampled training distribution. Evaluation sampling is always uniform.
 
-Latest local sampled run on `data\fusion-seg-v1`:
+Historical local sampled run on the legacy modulo-split `data\fusion-seg-v1`
+before unit-box normalization and official test preservation:
 
 ```text
 train_samples: 512 graphs / 10,375 faces
-val_samples:   128 graphs / 3,222 faces
+eval_samples:  128 graphs / 3,222 faces
 face_classes:  8
 class_weights: disabled
 train_sample:  uniform
-val_sample:    uniform
 final_loss:    1.496397
 train_acc:     45.21%
-val_acc:       50.87%
-val_macro_f1:  0.1832
+eval_acc:      50.87%
+eval_macro_f1: 0.1832
 checkpoint:    target\fusion-face-seg-default-smoke.safetensors
 train_counts:  segment_0:4899, segment_1:1218, segment_2:1690, segment_3:242,
                segment_4:1429, segment_5:193, segment_6:696, segment_7:8
-val_counts:    segment_0:1611, segment_1:351, segment_2:565, segment_3:110,
+eval_counts:   segment_0:1611, segment_1:351, segment_2:565, segment_3:110,
                segment_4:386, segment_5:48, segment_6:151, segment_7:0
 ```
 
 Comparison runs at the same 512/128 graph budget:
 
 ```text
-uniform + class weights:       val_acc 22.16%, val_macro_f1 0.1600
-face-balanced train + uniform val: val_acc 5.40%, val_macro_f1 0.0632
+uniform + class weights:         eval_acc 22.16%, eval_macro_f1 0.1600
+face-balanced train + uniform eval: eval_acc 5.40%, eval_macro_f1 0.0632
 ```
 
 ## Current Environment Status
 
 This workspace has a local OCCT package at `C:\tools\OpenCascade`, the raw
 Fusion extended STEP dataset at `data\s2.0.1_extended_step`, and the cleaned
-ACAD-format dataset at `data\fusion-seg-v1`.
+ACAD-format dataset at `data\fusion-seg-v1`. The existing full cleaned dataset
+was generated before official `test` preservation and manifest label histograms;
+regenerate it before using published-style metrics.
 
 ## Known Simplifications
 

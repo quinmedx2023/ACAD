@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use acad_brep_dataset::{
     load_manifest, load_metadata, load_samples, BrepSampleLabels, DatasetRecord, DatasetSplit,
@@ -34,6 +34,7 @@ use candle_nn::{
     conv1d, conv2d, layer_norm, linear, loss, ops, AdamW, Conv1d, Conv1dConfig, Conv2d,
     Conv2dConfig, LayerNorm, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap,
 };
+use serde::{Deserialize, Serialize};
 
 pub const CLASS_COUNT: usize = CLASS_NAMES.len();
 /// Output width of each geometry conv front-end.
@@ -90,13 +91,12 @@ pub struct FaceSegmentationConfig {
     pub batch_size: usize,
     /// Maximum train graph samples to load. `None` means all train samples.
     pub max_train_samples: Option<usize>,
-    /// Maximum validation graph samples to load. `None` means all validation samples.
-    pub max_val_samples: Option<usize>,
+    /// Maximum evaluation graph samples to load. `None` means all evaluation samples.
+    pub max_eval_samples: Option<usize>,
     pub use_class_weights: bool,
     /// Sampling strategy for training records when a sample limit is set.
     pub sampling_strategy: FaceSamplingStrategy,
-    /// Sampling strategy for validation records when a sample limit is set.
-    pub val_sampling_strategy: FaceSamplingStrategy,
+    pub eval_split: DatasetSplit,
     pub shuffle_each_epoch: bool,
 }
 
@@ -110,10 +110,10 @@ impl Default for FaceSegmentationConfig {
             seed: 42,
             batch_size: 8,
             max_train_samples: Some(1024),
-            max_val_samples: Some(256),
+            max_eval_samples: Some(256),
             use_class_weights: false,
             sampling_strategy: FaceSamplingStrategy::Uniform,
-            val_sampling_strategy: FaceSamplingStrategy::Uniform,
+            eval_split: DatasetSplit::Val,
             shuffle_each_epoch: true,
         }
     }
@@ -141,24 +141,21 @@ impl FaceSamplingStrategy {
 pub struct FaceSegmentationReport {
     pub epochs: usize,
     pub train_samples: usize,
-    pub val_samples: usize,
+    pub eval_samples: usize,
     pub train_faces: usize,
-    pub val_faces: usize,
+    pub eval_faces: usize,
     pub face_classes: usize,
     pub hidden_dim: usize,
     pub rounds: usize,
     pub batch_size: usize,
-    pub class_weighting: bool,
-    pub sampling_strategy: FaceSamplingStrategy,
-    pub val_sampling_strategy: FaceSamplingStrategy,
-    pub shuffle_each_epoch: bool,
+    pub eval_split: DatasetSplit,
     pub face_label_names: Vec<String>,
     pub train_face_label_counts: Vec<usize>,
-    pub val_face_label_counts: Vec<usize>,
+    pub eval_face_label_counts: Vec<usize>,
     pub final_loss: f32,
     pub train_accuracy: f32,
-    pub val_accuracy: f32,
-    pub val_macro_f1: f32,
+    pub eval_accuracy: f32,
+    pub eval_macro_f1: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -170,9 +167,12 @@ pub struct FaceSegmentationExample {
 #[derive(Debug, Clone)]
 pub struct FaceSegmentationDataset {
     pub train: Vec<FaceSegmentationExample>,
-    pub val: Vec<FaceSegmentationExample>,
+    pub eval: Vec<FaceSegmentationExample>,
     pub label_names: Vec<String>,
 }
+
+pub type LabeledGraphTensor = (GraphTensors, u32);
+pub type GraphClassificationDataset = (Vec<LabeledGraphTensor>, Vec<LabeledGraphTensor>);
 
 // ---------------------------------------------------------------------------
 // Dataset
@@ -206,7 +206,7 @@ pub fn synthetic_graphs(samples_per_class: usize) -> Vec<(BrepGraph, u32)> {
 pub fn build_dataset(
     samples_per_class: usize,
     val_fraction: f32,
-) -> Result<(Vec<(GraphTensors, u32)>, Vec<(GraphTensors, u32)>)> {
+) -> Result<GraphClassificationDataset> {
     let tensorizer = GraphTensorizer::default();
     let graphs = synthetic_graphs(samples_per_class);
     let stride = if val_fraction <= 0.0 {
@@ -231,9 +231,7 @@ pub fn build_dataset(
 }
 
 /// Load a real on-disk dataset written by `acad-brep-dataset`.
-pub fn build_dataset_from_dir(
-    root: &Path,
-) -> Result<(Vec<(GraphTensors, u32)>, Vec<(GraphTensors, u32)>)> {
+pub fn build_dataset_from_dir(root: &Path) -> Result<GraphClassificationDataset> {
     let tensorizer = GraphTensorizer::default();
     let samples = load_samples(root).map_err(to_candle_error)?;
     let mut train = Vec::new();
@@ -246,6 +244,7 @@ pub fn build_dataset_from_dir(
         match sample.record.split {
             DatasetSplit::Train => train.push((tensors, sample.labels.graph_class_id)),
             DatasetSplit::Val => val.push((tensors, sample.labels.graph_class_id)),
+            DatasetSplit::Test => {}
         }
     }
 
@@ -279,9 +278,9 @@ pub fn build_face_segmentation_dataset(
         .iter()
         .filter(|record| record.split == DatasetSplit::Train)
         .collect();
-    let val_records: Vec<_> = records
+    let eval_records: Vec<_> = records
         .iter()
-        .filter(|record| record.split == DatasetSplit::Val)
+        .filter(|record| record.split == config.eval_split)
         .collect();
 
     let tensorizer = GraphTensorizer::default();
@@ -297,13 +296,13 @@ pub fn build_face_segmentation_dataset(
         &label_to_id,
         &tensorizer,
     )?;
-    let val = load_face_examples(
+    let eval = load_face_examples(
         root,
         select_records_with_strategy(
             root,
-            &val_records,
-            config.max_val_samples,
-            config.val_sampling_strategy,
+            &eval_records,
+            config.max_eval_samples,
+            FaceSamplingStrategy::Uniform,
             &label_to_id,
         )?,
         &label_to_id,
@@ -312,7 +311,7 @@ pub fn build_face_segmentation_dataset(
 
     Ok(FaceSegmentationDataset {
         train,
-        val,
+        eval,
         label_names: metadata.face_label_set,
     })
 }
@@ -435,6 +434,20 @@ fn read_record_face_counts(
     record: &DatasetRecord,
     label_to_id: &BTreeMap<String, u32>,
 ) -> Result<Vec<usize>> {
+    if !record.face_label_counts.is_empty() {
+        let mut counts = vec![0usize; label_to_id.len()];
+        for (label, count) in &record.face_label_counts {
+            let label_id = label_to_id.get(label).copied().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "unknown face label {label:?} in manifest record {}",
+                    record.id
+                ))
+            })? as usize;
+            counts[label_id] += count;
+        }
+        return Ok(counts);
+    }
+
     let labels_json =
         fs::read_to_string(root.join(&record.labels_path)).map_err(to_candle_error)?;
     let labels: BrepSampleLabels = serde_json::from_str(&labels_json).map_err(to_candle_error)?;
@@ -594,8 +607,8 @@ impl BrepBatch {
             for &m in &item.coedge_mate {
                 coedge_mate.push(m + coedge_off);
             }
-            face_graph.extend(std::iter::repeat(graph_id).take(item.face_count));
-            edge_graph.extend(std::iter::repeat(graph_id).take(item.edge_count));
+            face_graph.resize(face_graph.len() + item.face_count, graph_id);
+            edge_graph.resize(edge_graph.len() + item.edge_count, graph_id);
 
             face_off += item.face_count as u32;
             edge_off += item.edge_count as u32;
@@ -1036,15 +1049,21 @@ fn train_face_segmentation_with_optional_save(
             "face segmentation dataset has no train samples".to_string(),
         ));
     }
+    if dataset.eval.is_empty() {
+        return Err(candle_core::Error::Msg(format!(
+            "face segmentation dataset has no {} samples; choose another evaluation split with --eval-split",
+            config.eval_split.as_str()
+        )));
+    }
 
     let device = Device::Cpu;
     let _ = device.set_seed(config.seed);
     let face_classes = dataset.label_names.len();
     let batch_size = config.batch_size.max(1);
     let train_faces = count_faces(&dataset.train);
-    let val_faces = count_faces(&dataset.val);
+    let eval_faces = count_faces(&dataset.eval);
     let train_face_label_counts = face_label_counts(&dataset.train, face_classes);
-    let val_face_label_counts = face_label_counts(&dataset.val, face_classes);
+    let eval_face_label_counts = face_label_counts(&dataset.eval, face_classes);
     let class_weights = if config.use_class_weights {
         Some(Tensor::from_vec(
             face_class_weights(&train_face_label_counts),
@@ -1099,35 +1118,120 @@ fn train_face_segmentation_with_optional_save(
 
     let (train_accuracy, _, _) =
         evaluate_face_segmentation(&model, &dataset.train, batch_size, &device, face_classes)?;
-    let (val_accuracy, val_macro_f1, _) =
-        evaluate_face_segmentation(&model, &dataset.val, batch_size, &device, face_classes)?;
+    let (eval_accuracy, eval_macro_f1, _) =
+        evaluate_face_segmentation(&model, &dataset.eval, batch_size, &device, face_classes)?;
 
     if let Some(save_path) = save_path {
         varmap.save(save_path)?;
+        save_face_checkpoint_metadata(save_path, config, &dataset.label_names)?;
     }
 
     Ok(FaceSegmentationReport {
         epochs: config.epochs,
         train_samples: dataset.train.len(),
-        val_samples: dataset.val.len(),
+        eval_samples: dataset.eval.len(),
         train_faces,
-        val_faces,
+        eval_faces,
         face_classes,
         hidden_dim: config.hidden_dim,
         rounds: config.rounds,
         batch_size,
-        class_weighting: config.use_class_weights,
-        sampling_strategy: config.sampling_strategy,
-        val_sampling_strategy: config.val_sampling_strategy,
-        shuffle_each_epoch: config.shuffle_each_epoch,
+        eval_split: config.eval_split,
         face_label_names: dataset.label_names,
         train_face_label_counts,
-        val_face_label_counts,
+        eval_face_label_counts,
         final_loss,
         train_accuracy,
-        val_accuracy,
-        val_macro_f1,
+        eval_accuracy,
+        eval_macro_f1,
     })
+}
+
+fn save_face_checkpoint_metadata(
+    save_path: &Path,
+    config: FaceSegmentationConfig,
+    label_names: &[String],
+) -> Result<()> {
+    let metadata = FaceCheckpointMetadata {
+        format: "acad-brep-face-checkpoint-v1".to_string(),
+        task: "face_segmentation".to_string(),
+        hidden_dim: config.hidden_dim,
+        rounds: config.rounds,
+        face_classes: label_names.len(),
+        face_label_names: label_names.to_vec(),
+    };
+    fs::write(
+        checkpoint_metadata_path(save_path),
+        serde_json::to_string_pretty(&metadata).map_err(to_candle_error)?,
+    )
+    .map_err(to_candle_error)
+}
+
+fn checkpoint_metadata_path(save_path: &Path) -> PathBuf {
+    save_path.with_extension("metadata.json")
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FaceCheckpointMetadata {
+    format: String,
+    task: String,
+    hidden_dim: usize,
+    rounds: usize,
+    face_classes: usize,
+    face_label_names: Vec<String>,
+}
+
+fn load_face_checkpoint_metadata(save_path: &Path) -> Result<FaceCheckpointMetadata> {
+    let metadata_path = checkpoint_metadata_path(save_path);
+    let json = fs::read_to_string(&metadata_path).map_err(to_candle_error)?;
+    let metadata: FaceCheckpointMetadata = serde_json::from_str(&json).map_err(to_candle_error)?;
+    validate_face_checkpoint_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+pub fn load_face_checkpoint(
+    save_path: &Path,
+    device: &Device,
+) -> Result<(FaceSegmentationModel, Vec<String>)> {
+    let metadata = load_face_checkpoint_metadata(save_path)?;
+    let mut varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DTYPE, device);
+    let model = FaceSegmentationModel::new(
+        metadata.hidden_dim,
+        metadata.rounds,
+        metadata.face_classes,
+        vb,
+    )?;
+    varmap.load(save_path)?;
+    Ok((model, metadata.face_label_names))
+}
+
+fn validate_face_checkpoint_metadata(metadata: &FaceCheckpointMetadata) -> Result<()> {
+    if metadata.format != "acad-brep-face-checkpoint-v1" {
+        return Err(candle_core::Error::Msg(format!(
+            "unsupported face checkpoint metadata format {:?}",
+            metadata.format
+        )));
+    }
+    if metadata.task != "face_segmentation" {
+        return Err(candle_core::Error::Msg(format!(
+            "unsupported face checkpoint task {:?}",
+            metadata.task
+        )));
+    }
+    if metadata.face_classes != metadata.face_label_names.len() {
+        return Err(candle_core::Error::Msg(format!(
+            "face checkpoint class count mismatch: model={}, labels={}",
+            metadata.face_classes,
+            metadata.face_label_names.len()
+        )));
+    }
+    if metadata.face_classes == 0 {
+        return Err(candle_core::Error::Msg(
+            "face checkpoint has no face classes".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn to_candle_error(error: impl std::error::Error) -> candle_core::Error {
@@ -1400,7 +1504,7 @@ mod tests {
             &root,
             FaceSegmentationConfig {
                 max_train_samples: None,
-                max_val_samples: None,
+                max_eval_samples: None,
                 ..Default::default()
             },
         )
@@ -1463,7 +1567,7 @@ mod tests {
                 rounds: 1,
                 batch_size: 2,
                 max_train_samples: None,
-                max_val_samples: None,
+                max_eval_samples: None,
                 ..Default::default()
             },
             &root,
@@ -1473,6 +1577,65 @@ mod tests {
         assert!(report.final_loss.is_finite());
         assert!(report.train_faces > 0);
         assert!(report.face_classes > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn face_checkpoint_writes_metadata_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "acad-brep-face-checkpoint-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        acad_brep_dataset::generate_synthetic_dataset(
+            &root,
+            acad_brep_dataset::DatasetConfig {
+                samples_per_class: 2,
+                val_fraction: 0.25,
+            },
+        )
+        .expect("dataset writes");
+
+        let checkpoint = root.join("face-model.safetensors");
+        train_face_segmentation_and_save(
+            FaceSegmentationConfig {
+                epochs: 1,
+                hidden_dim: 12,
+                rounds: 1,
+                batch_size: 2,
+                max_train_samples: None,
+                max_eval_samples: None,
+                ..Default::default()
+            },
+            &root,
+            &checkpoint,
+        )
+        .expect("face segmentation checkpoint saves");
+
+        let metadata = std::fs::read_to_string(checkpoint_metadata_path(&checkpoint))
+            .expect("metadata sidecar exists");
+        assert!(metadata.contains("acad-brep-face-checkpoint-v1"));
+        assert!(metadata.contains("face_label_names"));
+
+        let device = Device::Cpu;
+        let (model, label_names) =
+            load_face_checkpoint(&checkpoint, &device).expect("face checkpoint loads");
+        assert!(!label_names.is_empty());
+        let dataset = build_face_segmentation_dataset(
+            &root,
+            FaceSegmentationConfig {
+                max_train_samples: Some(1),
+                max_eval_samples: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("face dataset loads");
+        let batch = FaceSegBatch::from_examples(&dataset.train[..1], &device).expect("batch");
+        let logits = model
+            .forward_face_logits(&batch.batch)
+            .expect("face inference");
+        assert_eq!(logits.dim(1).unwrap(), label_names.len());
 
         let _ = std::fs::remove_dir_all(&root);
     }

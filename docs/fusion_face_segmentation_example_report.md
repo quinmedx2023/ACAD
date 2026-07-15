@@ -77,7 +77,8 @@ cargo run -p acad-brep-candle-train -- face-train `
   --hidden 32 `
   --batch-size 8 `
   --max-train-samples 512 `
-  --max-val-samples 128 `
+  --max-eval-samples 128 `
+  --eval-split test `
   --save target\fusion-face-seg-default-smoke.safetensors
 ```
 
@@ -86,7 +87,7 @@ Default settings for this example:
 | Setting | Value |
 |---------|-------|
 | train sampling | uniform |
-| val sampling | uniform |
+| eval sampling | uniform |
 | class weights | disabled |
 | shuffle each epoch | enabled |
 | epochs | 3 |
@@ -96,13 +97,13 @@ Default settings for this example:
 
 ## Sampled Label Coverage
 
-The default smoke loads 512 train graphs and 128 validation graphs from the
+The default smoke loads 512 train graphs and 128 eval graphs from the
 manifest. It does not load the full dataset.
 
 | Split | Graphs | Faces |
 |-------|-------:|------:|
 | train | 512 | 10,375 |
-| val | 128 | 3,222 |
+| eval | 128 | 3,222 |
 
 Sampled train face counts:
 
@@ -117,7 +118,7 @@ Sampled train face counts:
 | segment_6 | 696 |
 | segment_7 | 8 |
 
-Sampled validation face counts:
+Sampled eval face counts:
 
 | Label | Faces |
 |-------|------:|
@@ -130,19 +131,20 @@ Sampled validation face counts:
 | segment_6 | 151 |
 | segment_7 | 0 |
 
-The sampled validation split contains no `segment_7` faces, so this smoke cannot
+The sampled eval split contains no `segment_7` faces, so this smoke cannot
 measure performance on that rare class.
 
 ## Result
 
-Latest default smoke result:
+Historical default smoke result from the legacy modulo-split dataset, before
+unit-box tensor normalization and official `test` split preservation:
 
 | Metric | Value |
 |--------|------:|
 | final loss | 1.496397 |
 | train face accuracy | 45.21% |
-| validation face accuracy | 50.87% |
-| validation macro-F1 | 0.1832 |
+| eval face accuracy | 50.87% |
+| eval macro-F1 | 0.1832 |
 
 Checkpoint:
 
@@ -152,9 +154,9 @@ target\fusion-face-seg-default-smoke.safetensors
 
 ## Comparison Runs
 
-All comparison runs used the same 512 train graph / 128 validation graph budget.
+All comparison runs used the same 512 train graph / 128 eval graph budget.
 
-| Run | Class Weights | Train Sampling | Val Sampling | Val Accuracy | Val Macro-F1 |
+| Run | Class Weights | Train Sampling | Eval Sampling | Eval Accuracy | Eval Macro-F1 |
 |-----|---------------|----------------|--------------|-------------:|-------------:|
 | default smoke | no | uniform | uniform | 50.87% | 0.1832 |
 | uniform weighted | yes | uniform | uniform | 22.16% | 0.1600 |
@@ -169,8 +171,8 @@ segment_7 train faces:
   face-balanced: 496
 ```
 
-However, it produced a strong train/validation distribution shift at this small
-graph budget and performed worse on the uniform validation sample.
+However, it produced a strong train/eval distribution shift at this small graph
+budget and performed worse on the uniform eval sample.
 
 ## Interpretation
 
@@ -181,7 +183,16 @@ The example proves the real supervised task is wired correctly:
 - the encoder produces per-face embeddings
 - the classifier trains on real Fusion-derived BRep data
 - the CLI reports face accuracy, macro-F1, and sampled label coverage
-- checkpoint saving works
+- checkpoint saving works, with a metadata sidecar that records label names and
+  model shape
+
+Recent reliability optimizations are now part of the example pipeline:
+
+- training tensors use per-solid unit-box geometry normalization
+- cleaned Fusion manifests preserve the official `train_test.json` split
+- manifest rows include label histograms for faster sampling diagnostics
+- face checkpoints save label vocabulary and model shape sidecars, and
+  `load_face_checkpoint` reconstructs the model from that metadata
 
 The result is not yet a strong segmentation model. The current smoke is short,
 CPU-only, and sampled. It is useful as a regression test and baseline for the
@@ -199,7 +210,8 @@ cargo run -p acad-brep-candle-train -- face-train `
   --hidden 32 `
   --batch-size 8 `
   --max-train-samples 512 `
-  --max-val-samples 128
+  --max-eval-samples 128 `
+  --eval-split test
 ```
 
 Use `--class-weights` or `--sample-strategy face-balanced` only for diagnostics
@@ -208,7 +220,8 @@ until a better face-budgeted sampler is implemented.
 ## Next Work
 
 1. Add a face-budgeted sampler that limits total faces, not just graph count.
-2. Keep validation uniform or use a fixed validation subset for comparable runs.
+2. Regenerate the full Fusion dataset with official `test` preservation and
+   rerun comparable smoke metrics.
 3. Add per-class precision/recall/F1 reporting.
 4. Train longer with a larger sample budget after the sampler is stable.
 5. Add trimming-aware UV masks from OCCT face classification.

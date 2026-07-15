@@ -53,6 +53,13 @@ synthetic BRep fixture (+ sampled geometry)
 
 Default grid resolution: `uv_res = curve_res = 6`.
 
+`GraphTensorizer` normalizes geometry per graph by default. It computes a
+geometric bounding box from face/edge sampled points plus centroids/midpoints,
+centers coordinates on the bbox center, and divides coordinates and lengths by
+the largest bbox extent. Areas are divided by the squared extent. This keeps
+real Fusion parts modeled at different absolute scales in a comparable numeric
+range while leaving the on-disk JSON unchanged.
+
 ## Model
 
 `HybridBrepEncoder`:
@@ -107,25 +114,37 @@ cargo run -p acad-brep-candle-train -- face-train `
   --hidden 32 `
   --batch-size 8 `
   --max-train-samples 512 `
-  --max-val-samples 128
+  --max-eval-samples 128 `
+  --eval-split test
 ```
 
 Output fields include graph sample counts, face counts, `face_classes`,
-`train_face_accuracy`, `val_face_accuracy`, `val_face_macro_f1`, sampling
-strategy, and sampled face-label counts.
+`eval_split`, `train_face_accuracy`, `eval_face_accuracy`,
+`eval_face_macro_f1`, and sampled face-label counts.
+
+When `--save` is passed to `face-train`, the command writes a sidecar next to
+the weights, for example `target/fusion-face-seg-smoke.metadata.json`. The
+sidecar records the face-label vocabulary, hidden dimension, and message-passing
+rounds.
+Use `load_face_checkpoint` to reconstruct a face-segmentation model from the
+sidecar-backed hidden dimension, rounds, and class count instead of manually
+recreating those values.
 
 Useful face-training flags:
 
 ```text
 --sample-strategy uniform|face-balanced
---val-sample-strategy uniform|face-balanced
 --class-weights
+--eval-split val|test
 --no-shuffle
 ```
 
-Current short Fusion smoke tests favor uniform sampling without class weights.
-The face-balanced selector covers rare labels better, but changes the sampled
-training distribution and performed worse in the 512/128 graph smoke.
+Current short Fusion smoke tests favor uniform train sampling without class
+weights. The face-balanced selector covers rare labels better, but changes the
+sampled training distribution and performed worse in the 512/128 graph smoke.
+Evaluation sampling stays uniform.
+Official Fusion cleanup preserves the dataset's `test` split, so use
+`--eval-split test` deliberately for official train/test runs.
 
 Local run (54 train / 18 held-out val):
 

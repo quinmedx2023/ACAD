@@ -11,7 +11,7 @@
 use std::error::Error;
 use std::fmt;
 
-use acad_brep_graph::{BrepGraph, Convexity, CurveKind, GraphError, SurfaceKind};
+use acad_brep_graph::{BrepGraph, Convexity, CurveKind, GraphError, SurfaceKind, Vec3};
 
 pub const FACE_FEATURE_DIM: usize = SurfaceKind::COUNT + 7;
 pub const EDGE_FEATURE_DIM: usize = CurveKind::COUNT + Convexity::COUNT + 4;
@@ -251,6 +251,7 @@ impl GraphTensorizer {
         let uv_res = self.config.uv_res;
         let curve_res = self.config.curve_res;
         let uv_samples = uv_res * uv_res;
+        let normalization = GraphNormalization::from_graph(graph);
 
         let mut face_categorical = Vec::with_capacity(graph.faces.len() * FACE_CATEGORICAL_DIM);
         let mut face_scalar = Vec::with_capacity(graph.faces.len() * FACE_SCALAR_DIM);
@@ -261,10 +262,11 @@ impl GraphTensorizer {
                 SurfaceKind::COUNT,
                 face.surface.index(),
             );
-            face_scalar.push(scale(face.area, self.config.area_scale));
-            face_scalar.push(scale(face.centroid.x, self.config.length_scale));
-            face_scalar.push(scale(face.centroid.y, self.config.length_scale));
-            face_scalar.push(scale(face.centroid.z, self.config.length_scale));
+            let centroid = normalization.point(face.centroid);
+            face_scalar.push(scale(normalization.area(face.area), self.config.area_scale));
+            face_scalar.push(scale(centroid[0], self.config.length_scale));
+            face_scalar.push(scale(centroid[1], self.config.length_scale));
+            face_scalar.push(scale(centroid[2], self.config.length_scale));
             face_scalar.push(face.normal.x);
             face_scalar.push(face.normal.y);
             face_scalar.push(face.normal.z);
@@ -280,17 +282,14 @@ impl GraphTensorizer {
                         });
                     }
                     push_channel(&mut face_grid, &geometry.points, |p| {
-                        [
-                            scale(p.x, self.config.length_scale),
-                            scale(p.y, self.config.length_scale),
-                            scale(p.z, self.config.length_scale),
-                        ]
+                        let point = normalization.point(*p);
+                        point.map(|value| scale(value, self.config.length_scale))
                     });
                     push_channel(&mut face_grid, &geometry.normals, |n| [n.x, n.y, n.z]);
                     face_grid.extend_from_slice(&geometry.mask);
                 }
                 None => {
-                    face_grid.extend(std::iter::repeat(0.0).take(FACE_GRID_CHANNELS * uv_samples));
+                    face_grid.resize(face_grid.len() + FACE_GRID_CHANNELS * uv_samples, 0.0);
                 }
             }
         }
@@ -305,10 +304,14 @@ impl GraphTensorizer {
                 Convexity::COUNT,
                 edge.convexity.index(),
             );
-            edge_scalar.push(scale(edge.length, self.config.length_scale));
-            edge_scalar.push(scale(edge.midpoint.x, self.config.length_scale));
-            edge_scalar.push(scale(edge.midpoint.y, self.config.length_scale));
-            edge_scalar.push(scale(edge.midpoint.z, self.config.length_scale));
+            let midpoint = normalization.point(edge.midpoint);
+            edge_scalar.push(scale(
+                normalization.length(edge.length),
+                self.config.length_scale,
+            ));
+            edge_scalar.push(scale(midpoint[0], self.config.length_scale));
+            edge_scalar.push(scale(midpoint[1], self.config.length_scale));
+            edge_scalar.push(scale(midpoint[2], self.config.length_scale));
 
             match &edge.geometry {
                 Some(geometry) => {
@@ -321,16 +324,13 @@ impl GraphTensorizer {
                         });
                     }
                     push_channel(&mut edge_grid, &geometry.points, |p| {
-                        [
-                            scale(p.x, self.config.length_scale),
-                            scale(p.y, self.config.length_scale),
-                            scale(p.z, self.config.length_scale),
-                        ]
+                        let point = normalization.point(*p);
+                        point.map(|value| scale(value, self.config.length_scale))
                     });
                     push_channel(&mut edge_grid, &geometry.tangents, |t| [t.x, t.y, t.z]);
                 }
                 None => {
-                    edge_grid.extend(std::iter::repeat(0.0).take(EDGE_GRID_CHANNELS * curve_res));
+                    edge_grid.resize(edge_grid.len() + EDGE_GRID_CHANNELS * curve_res, 0.0);
                 }
             }
         }
@@ -364,6 +364,106 @@ impl GraphTensorizer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GraphNormalization {
+    center: Vec3,
+    scale: f32,
+}
+
+impl GraphNormalization {
+    fn from_graph(graph: &BrepGraph) -> Self {
+        let mut bounds = Bounds::default();
+        for face in &graph.faces {
+            bounds.include(face.centroid);
+            if let Some(geometry) = &face.geometry {
+                for &point in &geometry.points {
+                    bounds.include(point);
+                }
+            }
+        }
+        for edge in &graph.edges {
+            bounds.include(edge.midpoint);
+            if let Some(geometry) = &edge.geometry {
+                for &point in &geometry.points {
+                    bounds.include(point);
+                }
+            }
+        }
+
+        if !bounds.valid {
+            return Self {
+                center: Vec3::new(0.0, 0.0, 0.0),
+                scale: 1.0,
+            };
+        }
+
+        let center = Vec3::new(
+            (bounds.min.x + bounds.max.x) * 0.5,
+            (bounds.min.y + bounds.max.y) * 0.5,
+            (bounds.min.z + bounds.max.z) * 0.5,
+        );
+        let extent_x = bounds.max.x - bounds.min.x;
+        let extent_y = bounds.max.y - bounds.min.y;
+        let extent_z = bounds.max.z - bounds.min.z;
+        let scale = extent_x.max(extent_y).max(extent_z);
+        let scale = if scale.is_finite() && scale > 1e-9 {
+            scale
+        } else {
+            1.0
+        };
+
+        Self { center, scale }
+    }
+
+    fn point(&self, point: Vec3) -> [f32; 3] {
+        [
+            (point.x - self.center.x) / self.scale,
+            (point.y - self.center.y) / self.scale,
+            (point.z - self.center.z) / self.scale,
+        ]
+    }
+
+    fn length(&self, length: f32) -> f32 {
+        length / self.scale
+    }
+
+    fn area(&self, area: f32) -> f32 {
+        area / (self.scale * self.scale)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    min: Vec3,
+    max: Vec3,
+    valid: bool,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Self {
+            min: Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+            max: Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+            valid: false,
+        }
+    }
+}
+
+impl Bounds {
+    fn include(&mut self, point: Vec3) {
+        if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+            return;
+        }
+        self.valid = true;
+        self.min.x = self.min.x.min(point.x);
+        self.min.y = self.min.y.min(point.y);
+        self.min.z = self.min.z.min(point.z);
+        self.max.x = self.max.x.max(point.x);
+        self.max.y = self.max.y.max(point.y);
+        self.max.z = self.max.z.max(point.z);
+    }
+}
+
 /// Push three interleaved channels (x, y, z), one full channel at a time, so the
 /// grid ends up channel-major (`[..., channel, sample]`).
 fn push_channel<T, F>(output: &mut Vec<f32>, values: &[T], project: F)
@@ -393,12 +493,12 @@ fn scale(value: f32, denominator: f32) -> f32 {
 
 fn push_mean_features(output: &mut Vec<f32>, values: &[f32], count: usize, dim: usize) {
     if count == 0 {
-        output.extend(std::iter::repeat(0.0).take(dim));
+        output.resize(output.len() + dim, 0.0);
         return;
     }
 
     let start_len = output.len();
-    output.extend(std::iter::repeat(0.0).take(dim));
+    output.resize(output.len() + dim, 0.0);
     for row in values.chunks_exact(dim) {
         for (index, value) in row.iter().enumerate() {
             output[start_len + index] += value;
@@ -485,7 +585,7 @@ impl Error for EncodingShapeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acad_brep_graph::sample_box_graph;
+    use acad_brep_graph::{box_graph, sample_box_graph};
 
     #[test]
     fn encodes_sample_box_with_stable_shapes() {
@@ -554,6 +654,24 @@ mod tests {
         // Every synthetic coedge is mated, so no entry should self-reference.
         for (index, &mate) in tensors.coedge_mate.iter().enumerate() {
             assert_ne!(mate as usize, index);
+        }
+    }
+
+    #[test]
+    fn tensorizer_normalizes_large_graph_to_unit_box() {
+        let graph = box_graph(1000.0, 500.0, 250.0);
+        let tensors = GraphTensorizer::default()
+            .tensorize(&graph)
+            .expect("large box should tensorize");
+        let uv_samples = tensors.uv_res * tensors.uv_res;
+        let face_stride = FACE_GRID_CHANNELS * uv_samples;
+        for face in tensors.face_grid.chunks_exact(face_stride) {
+            for &coordinate in &face[..3 * uv_samples] {
+                assert!(
+                    coordinate.abs() <= 0.5 + 1e-5,
+                    "coordinate {coordinate} should be normalized"
+                );
+            }
         }
     }
 }

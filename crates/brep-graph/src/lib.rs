@@ -121,14 +121,6 @@ impl Vec3 {
         self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
     }
 
-    pub fn add(self, other: Self) -> Self {
-        Self::new(self.x + other.x, self.y + other.y, self.z + other.z)
-    }
-
-    pub fn sub(self, other: Self) -> Self {
-        Self::new(self.x - other.x, self.y - other.y, self.z - other.z)
-    }
-
     pub fn scale(self, factor: f32) -> Self {
         Self::new(self.x * factor, self.y * factor, self.z * factor)
     }
@@ -156,6 +148,22 @@ impl Vec3 {
         } else {
             self.scale(1.0 / length)
         }
+    }
+}
+
+impl std::ops::Add for Vec3 {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self::Output {
+        Self::new(self.x + other.x, self.y + other.y, self.z + other.z)
+    }
+}
+
+impl std::ops::Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self::Output {
+        Self::new(self.x - other.x, self.y - other.y, self.z - other.z)
     }
 }
 
@@ -240,7 +248,7 @@ pub fn sample_plane(
         let u = grid_coord(iu, u_res) * half_u;
         for iv in 0..v_res {
             let v = grid_coord(iv, v_res) * half_v;
-            let point = centroid.add(tangent.scale(u)).add(bitangent.scale(v));
+            let point = centroid + tangent.scale(u) + bitangent.scale(v);
             points.push(point);
             normals.push(normal);
             mask.push(1.0);
@@ -272,7 +280,7 @@ pub fn sample_cylinder(
         let (sin, cos) = theta.sin_cos();
         for iv in 0..v_res {
             let z = grid_coord(iv, v_res) * (height * 0.5);
-            let point = center.add(Vec3::new(radius * cos, radius * sin, z));
+            let point = center + Vec3::new(radius * cos, radius * sin, z);
             points.push(point);
             normals.push(Vec3::new(cos, sin, 0.0));
             mask.push(1.0);
@@ -303,14 +311,14 @@ pub fn sample_curve(kind: CurveKind, length: f32, midpoint: Vec3, res: usize) ->
             for i in 0..res {
                 let theta = (i as f32 / res as f32) * std::f32::consts::TAU;
                 let (sin, cos) = theta.sin_cos();
-                points.push(midpoint.add(Vec3::new(radius * cos, radius * sin, 0.0)));
+                points.push(midpoint + Vec3::new(radius * cos, radius * sin, 0.0));
                 tangents.push(Vec3::new(-sin, cos, 0.0));
             }
         }
         _ => {
             for i in 0..res {
                 let t = grid_coord(i, res) * (length * 0.5);
-                points.push(midpoint.add(Vec3::new(t, 0.0, 0.0)));
+                points.push(midpoint + Vec3::new(t, 0.0, 0.0));
                 tangents.push(Vec3::new(1.0, 0.0, 0.0));
             }
         }

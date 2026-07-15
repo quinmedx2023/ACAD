@@ -231,6 +231,47 @@ Candle-native per user request ("candle not OK?" → yes, Candle is capable).
 
 ## Session: 2026-07-15
 
+### Phase I: Real-data training reliability optimizations
+- **Status:** complete
+- Actions taken:
+  - Kept the OCCT C++ sidecar path and ignored the opencascade-rs direction per user request.
+  - Added default per-graph unit-box normalization in `GraphTensorizer`, including coordinate, length, and area normalization while leaving source JSON unchanged.
+  - Added manifest-level `face_label_counts` and `edge_label_counts`; old manifests remain readable through the existing label-file fallback.
+  - Added Fusion `--split-file` support in the OCCT sidecar and Rust wrapper; the wrapper auto-detects `train_test.json` and maps Fusion `test` ids to ACAD `val`.
+  - Added face checkpoint metadata sidecars with label names, model shape, tensorizer settings, and training/sampling configuration.
+  - Updated docs for dataset schema, Fusion cleanup, training pipeline, and the Fusion face segmentation report.
+- Verification:
+  - `cargo fmt --all` passed.
+  - `cargo test --workspace` passed before documentation updates.
+  - `cmake --build tools\occt_cleaner\build-openenv-release --config Release` passed.
+  - Real Fusion cleanup smoke with official split auto-detection wrote 5 records, 4 train / 1 val.
+  - Verified those 5 manifest splits match `data\s2.0.1_extended_step\train_test.json`.
+  - `cargo run -p acad-brep-candle-train -- inspect --data data\fusion-seg-optim-smoke` passed and reported label counts from the new manifest.
+  - `cargo run -p acad-brep-candle-train -- face-train --data data\fusion-seg-optim-smoke --epochs 1 --rounds 1 --hidden 16 --batch-size 2 --max-train-samples 0 --max-val-samples 0 --save target\fusion-optim-smoke.safetensors` passed and wrote `target\fusion-optim-smoke.metadata.json`.
+  - Final `cargo fmt --all -- --check` passed after documentation updates.
+  - Final `cargo test --workspace` passed: 22 unit tests plus doc tests.
+  - Final `cmake --build tools\occt_cleaner\build-openenv-release --config Release` reported `ninja: no work to do`.
+
+### Phase J: Reliability review fixes
+- **Status:** complete
+- Actions taken:
+  - Preserved official Fusion `test` splits instead of collapsing them into `val`.
+  - Made sidecar split files strict: duplicate ids and missing STEP ids now fail cleanup.
+  - Added `DatasetSplit::Test` and kept synthetic/custom `train`/`val` behavior intact.
+  - Added explicit face-segmentation `--eval-split val|test`.
+  - Renamed face-segmentation public report/dataset fields to `eval_*`; old CLI aliases `--max-val-samples` and `--val-sample-strategy` still work.
+  - Added metadata-backed `load_face_checkpoint` plus typed checkpoint metadata structs.
+  - Changed dataset summaries to use manifest label histograms when available.
+  - Updated docs to mark old Fusion metrics as historical and require intentional test evaluation for regenerated official Fusion data.
+- Verification:
+  - `cargo fmt --all` passed.
+  - `cargo test --workspace` passed: 23 unit tests plus doc tests.
+  - `cmake --build tools\occt_cleaner\build-openenv-release --config Release` passed with existing OCCT deprecation warnings.
+  - `clean-fusion --limit 5` wrote 4 train / 1 test records to `data\fusion-seg-review-smoke`.
+  - Verified those 5 manifest splits exactly match `train_test.json`.
+  - Default face training on that smoke failed clearly because no `val` rows exist.
+  - `face-train --eval-split test --max-eval-samples 0` passed and wrote `target\fusion-review-smoke.metadata.json` with `eval_split: test`.
+
 ### Phase G: Fusion face segmentation training
 - **Status:** complete
 - Actions taken:
@@ -413,6 +454,26 @@ Candle-native per user request ("candle not OK?" → yes, Candle is capable).
 | 2026-07-15 | MSVC linker could not open `msvcrt.lib` | 1 | Set explicit VS2022/Windows SDK `LIB` paths for cargo verification. |
 | 2026-07-15 | `onig_sys` could not find `vcruntime.h` | 1 | Set explicit VS2022 `PATH` and `INCLUDE` paths for cargo verification. |
 | 2026-07-15 | `git -c safe.directory=... status --short` warned about unreadable user git ignore | 1 | Noted only; command still listed generated files. |
+
+### Phase K: Simplification / over-design cleanup
+- **Status:** complete
+- Actions taken:
+  - Removed the public `GeometryNormalization` option and made per-graph unit-box tensor normalization unconditional.
+  - Removed legacy face-train aliases (`--max-val-samples`, `--val-sample-strategy`) and the separate eval sampling strategy; evaluation sampling is always uniform.
+  - Simplified `FaceSegmentationReport` output to metrics, counts, label names, and the chosen eval split.
+  - Reduced face checkpoint metadata to `format`, `task`, `hidden_dim`, `rounds`, `face_classes`, and `face_label_names`.
+  - Kept `load_face_checkpoint` metadata-backed, returning the reconstructed model plus label vocabulary.
+  - Added `tools/occt_cleaner/build-openenv-release/occt_cleaner.exe` to the default Windows sidecar lookup path.
+  - Replaced ambiguous `Vec3::add/sub` helpers with standard `Add`/`Sub` trait implementations.
+  - Removed clippy warnings in tensor padding, dataset iteration, and graph-classification dataset return types.
+  - Updated Fusion face-train docs to use `eval_*` output terminology and current checkpoint metadata behavior.
+- Verification:
+  - `cargo fmt --all` passed.
+  - `cargo clippy --workspace -- -D warnings` passed.
+  - `cargo test --workspace` passed: 23 unit tests plus doc tests.
+  - `cmake --build tools\occt_cleaner\build-openenv-release --config Release` passed.
+  - `clean-fusion --raw data\s2.0.1_extended_step --out data\fusion-seg-review-smoke --limit 5 --allow-boundary` passed using the default sidecar path: 5 records, 4 train, 1 test.
+  - `face-train --data data\fusion-seg-review-smoke --epochs 1 --rounds 1 --hidden 16 --batch-size 2 --max-train-samples 0 --max-eval-samples 0 --eval-split test --save target\fusion-review-smoke.safetensors` passed and wrote a minimal metadata sidecar.
 
 ## 5-Question Reboot Check
 | Question | Answer |

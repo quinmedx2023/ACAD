@@ -32,11 +32,16 @@ Current corpus:
 
 `dataset.json` records dataset-level metadata.
 
-`manifest.jsonl` has one JSON object per sample:
+`manifest.jsonl` has one JSON object per sample. New writers include
+per-record label histograms so samplers and diagnostics do not need to open
+every `labels/*.json` file:
 
 ```json
-{"id":"box_000000","split":"train","class_id":0,"class_name":"box","graph_path":"graphs/box_000000.json","labels_path":"labels/box_000000.json","stats":{"faces":6,"edges":12,"coedges":24,"face_adjacencies":12}}
+{"id":"box_000000","split":"train","class_id":0,"class_name":"box","graph_path":"graphs/box_000000.json","labels_path":"labels/box_000000.json","stats":{"faces":6,"edges":12,"coedges":24,"face_adjacencies":12},"face_label_counts":{"bottom":1,"side":4,"top":1},"edge_label_counts":{"convex_line":12}}
 ```
+
+The `face_label_counts` and `edge_label_counts` fields are optional for backward
+compatibility. Readers fall back to loading the label JSON when they are absent.
 
 Each graph JSON is a serialized `BrepGraph`:
 
@@ -46,6 +51,10 @@ Each graph JSON is a serialized `BrepGraph`:
 - face adjacency triples.
 
 Each label JSON stores graph, face, and edge labels.
+
+Supported manifest splits are `train`, `val`, and `test`. Synthetic datasets
+still generate `train`/`val`; Fusion cleanup preserves the official
+`train_test.json` names, so official Fusion test rows remain `test`.
 
 ## Commands
 

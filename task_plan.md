@@ -8,7 +8,7 @@ deployment inference. Proper training methodology (val split, seeding,
 normalization, F1, checkpoint load).
 
 ## Current Phase
-Phase H complete
+Phase K complete
 
 ## Phases
 
@@ -72,6 +72,32 @@ Phase H complete
 - [x] Compare a balanced sampled Fusion run against the uniform sampled smoke.
 - **Status:** complete
 
+### Phase I: Real-data training reliability optimizations
+- [x] Add per-solid geometry normalization in the Rust tensorizer.
+- [x] Add Fusion official split-file support while keeping modulo fallback.
+- [x] Save checkpoint metadata sidecars with label vocabulary and model config.
+- [x] Add manifest-level label counts for faster sampling diagnostics.
+- [x] Update docs and verify on synthetic + Fusion smoke data.
+- **Status:** complete
+
+### Phase J: Reliability review fixes
+- [x] Make split-file usage strict and preserve official `test` splits.
+- [x] Add explicit face-segmentation eval split selection.
+- [x] Add a metadata-backed face-checkpoint loader.
+- [x] Use manifest label counts in dataset summaries when available.
+- [x] Update stale docs/results notes and verify.
+- **Status:** complete
+
+### Phase K: Simplification / over-design cleanup
+- [x] Remove configurable tensorizer normalization; per-graph unit-box normalization is now always on.
+- [x] Remove face-train alias flags and separate eval sampling strategy.
+- [x] Reduce face checkpoint metadata to label vocabulary plus model shape.
+- [x] Keep eval reports focused on metrics/counts instead of echoing internal training toggles.
+- [x] Add `build-openenv-release` to the default OCCT sidecar search path.
+- [x] Clean clippy warnings in core vector math, tensor padding, and dataset loops.
+- [x] Update docs from `val_*` face-train terminology to `eval_*` where applicable.
+- **Status:** complete
+
 ## Decisions Made
 | Decision | Rationale |
 |----------|-----------|
@@ -85,6 +111,7 @@ Phase H complete
 | Add optional CMake OCCT fetch | Avoids mandatory manual install on clean machines while preserving the faster installed-OCCT path. |
 | Prefer `ACAD_OCCT_ROOT` for the official Windows OCCT package | Avoids importing optional Visualization/Draw CMake targets that require VTK; links only the STEP/BRep libraries used by the sidecar. |
 | Default Fusion face-train smoke uses uniform sampling and no class weights | On the current 512/128 sampled smoke, this produced better validation accuracy and macro-F1 than class weights or naive face-balanced training. Face-balanced remains available for coverage diagnostics. |
+| Ignore opencascade-rs for now | The C++ sidecar is already working and verified with local OCCT; current optimization work stays on schema, splitting, normalization, checkpoint metadata, and data loading. |
 
 ## Notes
 - Build needs MSVC/Windows SDK env (LIB/INCLUDE/PATH) per prior session.

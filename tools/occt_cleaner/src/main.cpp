@@ -52,6 +52,7 @@ constexpr int kCurveRes = 6;
 struct Args {
     fs::path raw;
     fs::path out;
+    fs::path split_file;
     std::optional<std::size_t> limit;
     double val_fraction = 0.25;
     bool allow_boundary = false;
@@ -516,6 +517,22 @@ std::string edge_label(const EdgeJson& edge) {
     return "other_edge";
 }
 
+std::map<std::string, int> count_face_labels(const std::vector<int>& seg) {
+    std::map<std::string, int> counts;
+    for (int label : seg) {
+        counts["segment_" + std::to_string(label)] += 1;
+    }
+    return counts;
+}
+
+std::map<std::string, int> count_edge_labels(const GraphJson& graph) {
+    std::map<std::string, int> counts;
+    for (const auto& edge : graph.edges) {
+        counts[edge_label(edge)] += 1;
+    }
+    return counts;
+}
+
 std::string lower_ext(const fs::path& path) {
     std::string ext = path.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
@@ -548,6 +565,105 @@ std::string split_by_index(std::size_t index, double val_fraction) {
     }
     const auto stride = std::max<std::size_t>(2, static_cast<std::size_t>(std::round(1.0 / val_fraction)));
     return index % stride == stride - 1 ? "val" : "train";
+}
+
+std::vector<std::string> parse_json_string_array_for_key(
+    const std::string& text,
+    const std::string& key) {
+    const std::string quoted_key = "\"" + key + "\"";
+    const std::size_t key_pos = text.find(quoted_key);
+    if (key_pos == std::string::npos) {
+        return {};
+    }
+    const std::size_t open = text.find('[', key_pos + quoted_key.size());
+    if (open == std::string::npos) {
+        return {};
+    }
+    const std::size_t close = text.find(']', open + 1);
+    if (close == std::string::npos) {
+        return {};
+    }
+
+    std::vector<std::string> values;
+    std::size_t pos = open + 1;
+    while (pos < close) {
+        pos = text.find('"', pos);
+        if (pos == std::string::npos || pos >= close) {
+            break;
+        }
+        ++pos;
+        std::string value;
+        bool escaped = false;
+        while (pos < close) {
+            const char ch = text[pos++];
+            if (escaped) {
+                value.push_back(ch);
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                break;
+            } else {
+                value.push_back(ch);
+            }
+        }
+        values.push_back(value);
+    }
+    return values;
+}
+
+void add_split_id(
+    std::unordered_map<std::string, std::string>& splits,
+    const std::string& id,
+    const std::string& split,
+    const fs::path& path) {
+    if (id.empty()) {
+        throw std::runtime_error("split file contains an empty id: " + path.string());
+    }
+    const auto [it, inserted] = splits.emplace(id, split);
+    if (!inserted) {
+        throw std::runtime_error(
+            "split file contains duplicate id " + id + " in " + path.string() +
+            " (first split=" + it->second + ", duplicate split=" + split + ")");
+    }
+}
+
+std::unordered_map<std::string, std::string> load_split_file(const fs::path& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("cannot open split file: " + path.string());
+    }
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::unordered_map<std::string, std::string> splits;
+    for (const auto& id : parse_json_string_array_for_key(text, "train")) {
+        add_split_id(splits, id, "train", path);
+    }
+    for (const auto& id : parse_json_string_array_for_key(text, "val")) {
+        add_split_id(splits, id, "val", path);
+    }
+    for (const auto& id : parse_json_string_array_for_key(text, "test")) {
+        add_split_id(splits, id, "test", path);
+    }
+    if (splits.empty()) {
+        throw std::runtime_error("split file has no train/val/test ids: " + path.string());
+    }
+    return splits;
+}
+
+std::string split_for_step(
+    const fs::path& step,
+    std::size_t index,
+    double val_fraction,
+    const std::unordered_map<std::string, std::string>& split_map) {
+    if (!split_map.empty()) {
+        const auto it = split_map.find(step.stem().string());
+        if (it != split_map.end()) {
+            return it->second;
+        }
+        throw std::runtime_error(
+            "STEP id " + step.stem().string() + " is missing from the split file");
+    }
+    return split_by_index(index, val_fraction);
 }
 
 std::vector<fs::path> collect_steps(const fs::path& raw, std::optional<std::size_t> limit) {
@@ -676,6 +792,17 @@ void write_json_string_array(std::ostream& out, const std::set<std::string>& val
     out << "]";
 }
 
+void write_json_count_object(std::ostream& out, const std::map<std::string, int>& counts) {
+    out << "{";
+    bool first = true;
+    for (const auto& [label, count] : counts) {
+        if (!first) out << ",";
+        first = false;
+        out << "\"" << json_escape(label) << "\":" << count;
+    }
+    out << "}";
+}
+
 Args parse_args(int argc, char** argv) {
     Args args;
     for (int i = 1; i < argc; ++i) {
@@ -690,6 +817,8 @@ Args parse_args(int argc, char** argv) {
             args.raw = next("--raw");
         } else if (arg == "--out") {
             args.out = next("--out");
+        } else if (arg == "--split-file") {
+            args.split_file = next("--split-file");
         } else if (arg == "--limit") {
             args.limit = static_cast<std::size_t>(std::stoull(next("--limit")));
         } else if (arg == "--val-fraction") {
@@ -697,7 +826,7 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--allow-boundary") {
             args.allow_boundary = true;
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: occt_cleaner --raw DIR --out DIR [--limit N] [--val-fraction F] [--allow-boundary]\n";
+            std::cout << "Usage: occt_cleaner --raw DIR --out DIR [--split-file PATH] [--limit N] [--val-fraction F] [--allow-boundary]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + arg);
@@ -717,6 +846,10 @@ int main(int argc, char** argv) {
 
         std::vector<fs::path> steps = collect_steps(args.raw, args.limit);
         auto seg_files = index_seg_files(args.raw);
+        std::unordered_map<std::string, std::string> split_map;
+        if (!args.split_file.empty()) {
+            split_map = load_split_file(args.split_file);
+        }
         if (steps.empty()) {
             throw std::runtime_error("no STEP files found");
         }
@@ -745,11 +878,13 @@ int main(int argc, char** argv) {
                 if (seg.size() != graph.faces.size()) {
                     throw std::runtime_error("seg face count mismatch");
                 }
-                for (int label : seg) {
-                    face_label_set.insert("segment_" + std::to_string(label));
+                const auto face_counts = count_face_labels(seg);
+                const auto edge_counts = count_edge_labels(graph);
+                for (const auto& entry : face_counts) {
+                    face_label_set.insert(entry.first);
                 }
-                for (const auto& edge : graph.edges) {
-                    edge_label_set.insert(edge_label(edge));
+                for (const auto& entry : edge_counts) {
+                    edge_label_set.insert(entry.first);
                 }
 
                 const std::string graph_path = "graphs/" + id + ".json";
@@ -757,7 +892,7 @@ int main(int argc, char** argv) {
                 write_graph(args.out / graph_path, graph);
                 write_labels(args.out / labels_path, seg, graph);
 
-                std::string split = split_by_index(i, args.val_fraction);
+                std::string split = split_for_step(step, i, args.val_fraction, split_map);
                 split_counts[split] += 1;
                 manifest << "{\"id\":\"" << json_escape(id) << "\",\"split\":\"" << split
                          << "\",\"class_id\":0,\"class_name\":\"fusion_part\",\"graph_path\":\""
@@ -765,7 +900,12 @@ int main(int argc, char** argv) {
                          << json_escape(labels_path) << "\",\"stats\":{\"faces\":"
                          << graph.faces.size() << ",\"edges\":" << graph.edges.size()
                          << ",\"coedges\":" << graph.coedges.size()
-                         << ",\"face_adjacencies\":" << graph.face_adjacency.size() << "}}\n";
+                         << ",\"face_adjacencies\":" << graph.face_adjacency.size()
+                         << "},\"face_label_counts\":";
+                write_json_count_object(manifest, face_counts);
+                manifest << ",\"edge_label_counts\":";
+                write_json_count_object(manifest, edge_counts);
+                manifest << "}\n";
                 ++records;
             } catch (const std::exception& error) {
                 skipped << "{\"id\":\"" << json_escape(id) << "\",\"reason\":\""

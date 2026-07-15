@@ -11,7 +11,7 @@ use acad_brep_candle_train::{
     TrainingReport,
 };
 use acad_brep_dataset::{
-    generate_synthetic_dataset, summarize_dataset, DatasetConfig, DatasetSummary,
+    generate_synthetic_dataset, summarize_dataset, DatasetConfig, DatasetSplit, DatasetSummary,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -86,6 +86,8 @@ struct CleanFusionArgs {
     raw: PathBuf,
     out: PathBuf,
     exe: PathBuf,
+    split_file: Option<PathBuf>,
+    use_default_split_file: bool,
     limit: Option<usize>,
     allow_boundary: bool,
 }
@@ -138,6 +140,8 @@ fn parse_clean_fusion_args(args: impl Iterator<Item = String>) -> CleanFusionArg
     let mut raw = None;
     let mut out = PathBuf::from("data/fusion-seg-v1");
     let mut exe = default_occt_cleaner_path();
+    let mut split_file = None;
+    let mut use_default_split_file = true;
     let mut limit = None;
     let mut allow_boundary = false;
     let mut args = args.peekable();
@@ -147,6 +151,10 @@ fn parse_clean_fusion_args(args: impl Iterator<Item = String>) -> CleanFusionArg
             "--raw" => raw = Some(PathBuf::from(next_string(&mut args, "--raw"))),
             "--out" => out = PathBuf::from(next_string(&mut args, "--out")),
             "--exe" => exe = PathBuf::from(next_string(&mut args, "--exe")),
+            "--split-file" => {
+                split_file = Some(PathBuf::from(next_string(&mut args, "--split-file")))
+            }
+            "--no-split-file" => use_default_split_file = false,
             "--limit" => limit = Some(parse_next(&mut args, "--limit")),
             "--allow-boundary" => allow_boundary = true,
             "--help" | "-h" => {
@@ -166,6 +174,8 @@ fn parse_clean_fusion_args(args: impl Iterator<Item = String>) -> CleanFusionArg
         raw,
         out,
         exe,
+        split_file,
+        use_default_split_file,
         limit,
         allow_boundary,
     }
@@ -228,9 +238,9 @@ fn parse_face_train_args(args: impl Iterator<Item = String>) -> FaceTrainArgs {
                 config.max_train_samples =
                     parse_optional_limit(parse_next(&mut args, "--max-train-samples"));
             }
-            "--max-val-samples" => {
-                config.max_val_samples =
-                    parse_optional_limit(parse_next(&mut args, "--max-val-samples"));
+            "--max-eval-samples" => {
+                config.max_eval_samples =
+                    parse_optional_limit(parse_next(&mut args, "--max-eval-samples"));
             }
             "--class-weights" => config.use_class_weights = true,
             "--no-class-weights" => config.use_class_weights = false,
@@ -238,9 +248,8 @@ fn parse_face_train_args(args: impl Iterator<Item = String>) -> FaceTrainArgs {
                 config.sampling_strategy =
                     parse_face_sampling_strategy(next_string(&mut args, "--sample-strategy"))
             }
-            "--val-sample-strategy" => {
-                config.val_sampling_strategy =
-                    parse_face_sampling_strategy(next_string(&mut args, "--val-sample-strategy"))
+            "--eval-split" => {
+                config.eval_split = parse_eval_split(next_string(&mut args, "--eval-split"))
             }
             "--no-shuffle" => config.shuffle_each_epoch = false,
             "--save" => save = Some(PathBuf::from(next_string(&mut args, "--save"))),
@@ -262,6 +271,19 @@ fn run_clean_fusion(args: CleanFusionArgs) -> Result<(), Box<dyn Error>> {
         .arg(&args.raw)
         .arg("--out")
         .arg(&args.out);
+    let split_file = if let Some(split_file) = args.split_file {
+        if !split_file.is_file() {
+            return Err(format!("split file does not exist: {}", split_file.display()).into());
+        }
+        Some(split_file)
+    } else {
+        args.use_default_split_file
+            .then(|| args.raw.join("train_test.json"))
+            .filter(|path| path.is_file())
+    };
+    if let Some(split_file) = split_file {
+        command.arg("--split-file").arg(split_file);
+    }
     if let Some(limit) = args.limit {
         command.arg("--limit").arg(limit.to_string());
     }
@@ -286,6 +308,10 @@ fn run_clean_fusion(args: CleanFusionArgs) -> Result<(), Box<dyn Error>> {
 
 fn default_occt_cleaner_path() -> PathBuf {
     if cfg!(windows) {
+        let openenv = PathBuf::from("tools/occt_cleaner/build-openenv-release/occt_cleaner.exe");
+        if openenv.exists() {
+            return openenv;
+        }
         let multi_config = PathBuf::from("tools/occt_cleaner/build/Release/occt_cleaner.exe");
         if multi_config.exists() {
             multi_config
@@ -527,35 +553,26 @@ fn print_face_report(report: &FaceSegmentationReport) {
     println!("Fusion face segmentation training complete");
     println!("epochs: {}", report.epochs);
     println!("train_samples: {}", report.train_samples);
-    println!("val_samples: {}", report.val_samples);
+    println!("eval_split: {}", report.eval_split.as_str());
+    println!("eval_samples: {}", report.eval_samples);
     println!("train_faces: {}", report.train_faces);
-    println!("val_faces: {}", report.val_faces);
+    println!("eval_faces: {}", report.eval_faces);
     println!("face_classes: {}", report.face_classes);
     println!("hidden_dim: {}", report.hidden_dim);
     println!("rounds: {}", report.rounds);
     println!("batch_size: {}", report.batch_size);
-    println!("class_weighting: {}", report.class_weighting);
-    println!(
-        "train_sampling_strategy: {}",
-        report.sampling_strategy.as_str()
-    );
-    println!(
-        "val_sampling_strategy: {}",
-        report.val_sampling_strategy.as_str()
-    );
-    println!("shuffle_each_epoch: {}", report.shuffle_each_epoch);
     println!(
         "train_face_label_counts: {}",
         format_face_label_counts(&report.face_label_names, &report.train_face_label_counts)
     );
     println!(
-        "val_face_label_counts: {}",
-        format_face_label_counts(&report.face_label_names, &report.val_face_label_counts)
+        "eval_face_label_counts: {}",
+        format_face_label_counts(&report.face_label_names, &report.eval_face_label_counts)
     );
     println!("final_loss: {:.6}", report.final_loss);
     println!("train_face_accuracy: {:.2}%", report.train_accuracy * 100.0);
-    println!("val_face_accuracy: {:.2}%", report.val_accuracy * 100.0);
-    println!("val_face_macro_f1: {:.4}", report.val_macro_f1);
+    println!("eval_face_accuracy: {:.2}%", report.eval_accuracy * 100.0);
+    println!("eval_face_macro_f1: {:.4}", report.eval_macro_f1);
 }
 
 fn print_summary(summary: &DatasetSummary) {
@@ -599,6 +616,17 @@ fn parse_face_sampling_strategy(value: String) -> FaceSamplingStrategy {
     }
 }
 
+fn parse_eval_split(value: String) -> DatasetSplit {
+    match value.as_str() {
+        "val" | "validation" => DatasetSplit::Val,
+        "test" => DatasetSplit::Test,
+        other => {
+            eprintln!("invalid eval split {other:?}; expected val or test");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn format_face_label_counts(names: &[String], counts: &[usize]) -> String {
     names
         .iter()
@@ -626,14 +654,15 @@ fn print_help() {
         "Usage:\n  \
          brep-candle-train dataset [--out DIR] [--samples-per-class N] [--val-fraction F]\n  \
          brep-candle-train inspect [--data DIR]\n  \
-         brep-candle-train clean-fusion --raw DIR [--out DIR] [--exe PATH] [--limit N] [--allow-boundary]\n  \
+         brep-candle-train clean-fusion --raw DIR [--out DIR] [--exe PATH] [--split-file PATH] \
+         [--no-split-file] [--limit N] [--allow-boundary]\n  \
          brep-candle-train train [--data DIR] [--epochs N] [--lr LR] [--hidden N] \
          [--samples-per-class N] [--rounds N] [--seed N] [--val-fraction F] [--save PATH]\n  \
          brep-candle-train face-train [--data DIR] [--epochs N] [--lr LR] [--hidden N] \
          [--rounds N] [--seed N] [--batch-size N] [--max-train-samples N] \
-         [--max-val-samples N] [--sample-strategy uniform|face-balanced] \
-         [--val-sample-strategy uniform|face-balanced] [--class-weights] \
-         [--no-class-weights] [--no-shuffle] [--save PATH]\n\n  \
+         [--max-eval-samples N] [--sample-strategy uniform|face-balanced] \
+         [--class-weights] [--no-class-weights] [--eval-split val|test] \
+         [--no-shuffle] [--save PATH]\n\n  \
          Without a subcommand, training uses the in-memory synthetic dataset for backward compatibility."
     );
 }
